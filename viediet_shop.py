@@ -9,14 +9,15 @@ import json
 import os
 import time
 import html
+import threading
 import urllib.request
 import urllib.error
 
 # ============================================================
 # CONFIG - edit these
 # ============================================================
-TOKEN = "8656548047:AAHy718UTl9FThB6WkzPx1H65OIgwrp_9uo"          # @BotFather se token
-ADMIN_ID = 1364476174                         # tera Telegram user id
+TOKEN = os.environ.get("BOT_TOKEN")  # @BotFather se token
+ADMIN_ID = int(os.environ.get("ADMIN_ID", "1364476174"))            # tera Telegram user id
 CURRENCY = "₹"
 SUPPORT_LINK = "https://t.me/viedietlooterschat"   # support group link
 
@@ -1234,10 +1235,31 @@ def handle_command(msg, cmd, args):
 # ============================================================
 # MAIN LOOP
 # ============================================================
+def _keepalive_http():
+    """Railway/Hosting par PORT env diya ho to chhota HTTP server chalata hai
+    taaki free plan par service sleep na ho (health check / ping se awake rehti hai)."""
+    try:
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        port = int(os.environ.get("PORT", "0"))
+        if port <= 0:
+            return
+        class H(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b"ok")
+            def log_message(self, *a):
+                pass
+        HTTPServer(("0.0.0.0", port), H).serve_forever()
+    except Exception:
+        pass
+
+
 def main():
     if TOKEN.startswith("PASTE"):
         print("Open viediet_shop.py and set TOKEN and ADMIN_ID first.")
         return
+    threading.Thread(target=_keepalive_http, daemon=True).start()
     print("Viediet Shop bot is running! (Ctrl+C to stop)")
     offset = DATA.get("poll_offset", 0)
     retry = 1
