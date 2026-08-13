@@ -1,0 +1,153 @@
+{
+  "setup": {
+    "brand": "Viediet Shop",
+    "tagline": "Coupons & Gift Cards - Instant Delivery",
+    "welcome": "Welcome! Pick a product, pay via UPI QR and get your codes instantly.",
+    "upi_id": "",
+    "qr_file_id": "AgACAgUAAxkBAAM_anifqMZNkLbeWLmgFG42dFwP3bgAAjAUaxtGjsBXe2DnPHiLxj0BAAMCAAN4AAM9BA",
+    "support": "https://t.me/viedietlooterschat",
+    "terms": "1. BUY karne se pehle apni SCREEN RECORDING ON kar lein.\n2. Screen recording ke bina NO REFUND / NO REPLACEMENT milega.\n3. Payment sirf diya gaya QR scan karke karein, exact amount ka.\n4. Codes ek baar use hone ke baad repeat nahi hote.\n5. Galat amount / galat UPI se payment hone par refund nahi milega."
+  },
+  "admins": [
+    1364476174
+  ],
+  "users": {
+    "1364476174": {
+      "name": "Viediet",
+      "at": 1786289946
+    },
+    "8139558808": {
+      "name": "O",
+      "at": 1786622790
+    }
+  },
+  "products": {
+    "P2": {
+      "id": "P2",
+      "name": "Blinkit 100 Off Codes",
+      "price": 25.0,
+      "category": "Blinkit",
+      "codes": [],
+      "at": 1786606261952
+    }
+  },
+  "orders": [
+    {
+      "id": "ORD0001",
+      "userId": 1364476174,
+      "userName": "Viediet Extraa ⚡",
+      "productId": "P1",
+      "productName": "blinkt",
+      "qty": 1,
+      "price": 30.0,
+      "total": 30.0,
+      "status": "pending",
+      "codes": [],
+      "at": 1786290120858
+    },
+    {
+      "id": "ORD0002",
+      "userId": 1364476174,
+      "userName": "Viediet Extraa ⚡",
+      "productId": "P2",
+      "productName": "Blinkit 100 Off Codes",
+      "qty": 1,
+      "price": 1.0,
+      "total": 1.0,
+      "status": "delivered",
+      "codes": [
+        "BLAMULAAGXEHJTLL"
+      ],
+      "at": 1786606343292,
+      "paidAt": 1786606967595
+    },
+    {
+      "id": "ORD0003",
+      "userId": 8139558808,
+      "userName": "O",
+      "productId": "P2",
+      "productName": "Blinkit 100 Off Codes",
+      "qty": 3,
+      "price": 25.0,
+      "total": 75.0,
+      "status": "delivered",
+      "codes": [
+        "BLAMULAAH8VC5YUL",
+        "BLAMULAAHBF2RVUL",
+        "BLAMULAAH2YG8ZUL"
+      ],
+      "at": 1786622939351,
+      "ss": "AgACAgUAAxkBAAPjan20F3FGZmY6XNOlr3-cjuOFBbgAAlUTaxtEq-lXQbuxmtG5_R8BAAMCAAN4AAM9BA",
+      "paidAt": 1786623021424
+    },
+    {
+      "id": "ORD0004",
+      "userId": 1364476174,
+      "userName": "Viediet Extraa ⚡ @Viedietextraa",
+      "productId": "P2",
+      "productName": "Blinkit 100 Off Codes",
+      "qty": 11,
+      "price": 25.0,
+      "total": 275.0,
+      "status": "delivered",
+      "codes": [
+        "BLAMULAAH3RTKZUL",
+        "BLAMULAAHSGSDYUL",
+        "BLAMULAAH4FRMXUL",
+        "BLAMULAAG1VF2PLL",
+        "BLAMULAAGXEHJTLL",
+        "BLAMULAAG91ATVLL",
+        "BLAMULAAFWSF6H3H",
+        "BLAMULAAHTTFMZNY",
+        "BLAMULAAF5BUL41C",
+        "BLAMULAAH21JNCKL",
+        "BLAMULAAH2JWDCKL"
+      ],
+      "at": 1786623654288,
+      "paidAt": 1786623682810
+    },
+    {
+      "id": "ORD0005",
+      "userId": 1364476174,
+      "userName": "Viediet Extraa ⚡ @Viedietextraa",
+      "productId": "P2",
+      "productName": "Blinkit 100 Off Codes",
+      "qty": 23,
+      "price": 25.0,
+      "total": 575.0,
+      "status": "delivered",
+      "codes": [
+        "BLAMULAAHNAZHFKL",
+        "BLAMULAAHSBLKFKL",
+        "BLAMULAAHVTV8CKL",
+        "BLAMULAAHG3B9FKL",
+        "BLAMULAAHSZUPBKL",
+        "BLAMULAAHG7SDCKL",
+        "BLAMULAAH4ADDDKL",
+        "BLAMULAAHIIIYDKL",
+        "BLAMULAAFYGNIEIA",
+        "BLAMULAAFK6Z3MCA",
+        "BLAMULAAGR65QRLL",
+        "BLAMULAAGDNZ2WLL",
+        "BLAMULAAGMZVT3LL",
+        "BLAMULAAG4DSPYLL",
+        "BLAMULAAGINTTZLL",
+        "BLAMULAAGAFBWRLL",
+        "BLAMULAAFWEMWFBI",
+        "BLAMULAAGUWIYTLL",
+        "BLAMULAAGLCHWS6L",
+        "BLAMULAAHTVRQ1UL",
+        "BLAMULAAHEC41ZUL",
+        "BLAMULAAHJQX7XUL",
+        "BLAMULAAHPR5MWUL"
+      ],
+      "at": 1786623842766,
+      "paidAt": 1786623856046
+    }
+  ],
+  "seq": {
+    "product": 2,
+    "order": 5
+  },
+  "poll_offset": 601176226
+}
