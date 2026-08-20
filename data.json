@@ -1,0 +1,68 @@
+{
+  "setup": {
+    "brand": "Viediet Shop",
+    "tagline": "Coupons & Gift Cards - Instant Delivery",
+    "welcome": "Welcome! Pick a product, pay via UPI QR and get your codes instantly.",
+    "upi_id": "",
+    "qr_file_id": "",
+    "support": "https://t.me/viedietlooterschat",
+    "terms": "1. BUY karne se pehle apni SCREEN RECORDING ON kar lein.\n2. Screen recording ke bina NO REFUND / NO REPLACEMENT milega.\n3. Payment sirf diya gaya QR scan karke karein, exact amount ka.\n4. Codes ek baar use hone ke baad repeat nahi hote.\n5. Galat amount / galat UPI se payment hone par refund nahi milega."
+  },
+  "admins": [
+    1364476174
+  ],
+  "users": {
+    "1364476174": {
+      "name": "Viediet",
+      "at": 1787235109
+    }
+  },
+  "products": {
+    "P1": {
+      "id": "P1",
+      "name": "Ice cream",
+      "price": 1.0,
+      "category": "Blinkit",
+      "codes": [],
+      "at": 1787235151594
+    }
+  },
+  "orders": [
+    {
+      "id": "ORD0001",
+      "txn_id": "ORD1787235261708",
+      "userId": 1364476174,
+      "userName": "Viediet Extraa ⚡ @Viedietextraa",
+      "productId": "P1",
+      "productName": "Ice cream",
+      "qty": 1,
+      "price": 1.0,
+      "total": 1.0,
+      "status": "pending",
+      "codes": [],
+      "at": 1787235261708
+    },
+    {
+      "id": "ORD0002",
+      "txn_id": "ORD1787235777280",
+      "userId": 1364476174,
+      "userName": "Viediet Extraa ⚡ @Viedietextraa",
+      "productId": "P1",
+      "productName": "Ice cream",
+      "qty": 1,
+      "price": 1.0,
+      "total": 1.0,
+      "status": "delivered",
+      "codes": [
+        "BLAMULAAF3NJGTGA"
+      ],
+      "at": 1787235777280,
+      "paidAt": 1787235805781
+    }
+  ],
+  "seq": {
+    "product": 1,
+    "order": 2
+  },
+  "poll_offset": 601178074
+}

@@ -12,14 +12,25 @@ import html
 import threading
 import urllib.request
 import urllib.error
+import urllib.parse
 
 # ============================================================
 # CONFIG - edit these
 # ============================================================
-TOKEN = os.environ.get("BOT_TOKEN")  # @BotFather se token
+TOKEN = os.environ.get("BOT_TOKEN", "8656548047:AAHy718UTl9FThB6WkzPx1H65OIgwrp_9uo")  # @BotFather se token
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "1364476174"))            # tera Telegram user id
 CURRENCY = "₹"
 SUPPORT_LINK = "https://t.me/viedietlooterschat"   # support group link
+
+# ============================================================
+# PAYMENT GATEWAY - AUTO VERIFICATION (API-based)
+# (QR auto-generate hota hai, payment auto-verify hota hai)
+# ============================================================
+PAYMENT_API_KEY = os.environ.get("PAYMENT_API_KEY", "PAYB5854A51403EA6F080279257")
+PAY_UPI_ID = os.environ.get("PAY_UPI_ID", "paytm.s1dw5n0@pty")
+PAYMENT_API_URL = os.environ.get("PAYMENT_API_URL", "https://vcapi.vcstore.site/payment_api.php")
+PAYMENT_CHECK_INTERVAL = int(os.environ.get("PAYMENT_CHECK_INTERVAL", "15"))   # seconds
+PAYMENT_TIMEOUT_MIN = int(os.environ.get("PAYMENT_TIMEOUT_MIN", "30"))         # order cancel after X min pending
 
 API_BASE = "https://api.telegram.org/bot" + TOKEN
 # DATA_FILE: env variable "DATA_FILE" se override ho sakta hai (Railway volume ke liye).
@@ -73,8 +84,17 @@ def fresh_data():
 def save_data(data=None):
     if data is None:
         data = DATA
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        # agar DATA_FILE (/data/data.json) writable nahi (volume missing),
+        # toh project folder mein default file use karo
+        try:
+            with open(_DEFAULT_DATA, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print("[data] save error:", e)
 
 
 def load_data():
@@ -136,19 +156,24 @@ def api_call(method, payload=None):
     url = API_BASE + "/" + method
     body = json.dumps(payload or {}).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            res = json.loads(resp.read().decode("utf-8"))
-            if res.get("ok"):
-                return res.get("result")
-            _print_error(method, res.get("description", "api error"))
+    # SSL / network hiccup ho to 3 baar try karo (Telegram API thoda slow ho sakta hai)
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                if res.get("ok"):
+                    return res.get("result")
+                _print_error(method, res.get("description", "api error"))
+                return None
+        except urllib.error.HTTPError as e:
+            _print_error(method, "HTTP " + str(e.code) + " " + e.read().decode("utf-8", "ignore")[:200])
             return None
-    except urllib.error.HTTPError as e:
-        _print_error(method, "HTTP " + str(e.code) + " " + e.read().decode("utf-8", "ignore")[:200])
-        return None
-    except Exception as e:
-        _print_error(method, e)
-        return None
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            _print_error(method, e)
+    return None
 
 
 def send_message(chat_id, text, kb=None, parse_mode="HTML"):
@@ -178,6 +203,67 @@ def send_photo(chat_id, file_id, caption=None, kb=None, parse_mode="HTML"):
             plain["parse_mode"] = parse_mode
         return api_call("sendPhoto", plain)
     return result
+
+
+def send_photo_url(chat_id, image_urls, caption=None, kb=None, parse_mode="HTML"):
+    """QR image download karke multipart upload - 100% reliable.
+    image_urls: ek URL ya list of URLs - pehla jo kaam kare wahi bhejo."""
+    if isinstance(image_urls, str):
+        image_urls = [image_urls]
+    import uuid as _uuid
+    img_bytes = None
+    for image_url in image_urls:
+        try:
+            req = urllib.request.Request(image_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ViedietShop/1.0"
+            })
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                img_bytes = resp.read()
+            if img_bytes:
+                break
+        except Exception as e:
+            _print_error("qr_download", e)
+            img_bytes = None
+    if not img_bytes:
+        return None
+
+    boundary = "----Viediet" + _uuid.uuid4().hex
+    def _field(name, value):
+        return ('--' + boundary + '\r\n'
+                'Content-Disposition: form-data; name="{}"\r\n\r\n{}\r\n').format(name, value).encode("utf-8")
+    def _photo():
+        return ('--' + boundary + '\r\n'
+                'Content-Disposition: form-data; name="photo"; filename="qr.png"\r\n'
+                'Content-Type: image/png\r\n\r\n').encode("utf-8") + img_bytes + b'\r\n'
+    body = b""
+    body += _field("chat_id", str(chat_id))
+    body += _photo()
+    if caption:
+        body += _field("caption", caption)
+        body += _field("parse_mode", parse_mode)
+    if kb is not None:
+        body += _field("reply_markup", json.dumps(kb))
+    body += ('--' + boundary + '--\r\n').encode("utf-8")
+
+    url = API_BASE + "/sendPhoto"
+    req2 = urllib.request.Request(url, data=body, headers={
+        "Content-Type": "multipart/form-data; boundary=" + boundary,
+        "Content-Length": str(len(body)),
+        "User-Agent": "Mozilla/5.0 ViedietShop/1.0"
+    })
+    try:
+        with urllib.request.urlopen(req2, timeout=60) as resp:
+            res = json.loads(resp.read().decode("utf-8"))
+            if res.get("ok"):
+                return res.get("result")
+            _print_error("sendPhoto", res.get("description", "api error"))
+            return None
+    except urllib.error.HTTPError as e:
+        _print_error("sendPhoto", "HTTP " + str(e.code) + " " + e.read().decode("utf-8", "ignore")[:200])
+        return None
+    except Exception as e:
+        _print_error("sendPhoto", e)
+        return None
 
 
 def edit_message(chat_id, msg_id, text, kb=None, parse_mode="HTML"):
@@ -240,6 +326,117 @@ def bar(pct, width=10):
     pct = max(0, min(100, pct))
     full = int(round(pct / 100.0 * width))
     return "▰" * full + "▱" * (width - full)
+
+
+# ============================================================
+# PAYMENT GATEWAY - AUTO VERIFICATION (qrgen.txt logic)
+# ============================================================
+def pay_txn_id():
+    """Unique transaction id - QR aur API dono ke liye (ORD + timestamp)."""
+    return "ORD" + str(int(time.time() * 1000))
+
+
+def pay_qr_urls(txn_id, amount):
+    """QR image ke MULTIPLE URL banao - agar ek fail ho toh doosra try hoga.
+    1st: quickchart.io (HD) / 2nd: api.qrserver.com / 3rd: goqr.me"""
+    upi = ("upi://pay?pa={}"
+           "&pn={}"
+           "&tid={}"
+           "&tr={}"
+           "&tn={}"
+           "&am={}"
+           "&cu=INR").format(PAY_UPI_ID,
+                             urllib.parse.quote("VC Payment Gateway"),
+                             txn_id, txn_id,
+                             urllib.parse.quote("VC Payment"),
+                             amount)
+    q = urllib.parse.quote(upi)
+    return [
+        "https://quickchart.io/qr?text=" + q + "&size=1000&margin=4&ecLevel=H&format=png",
+        "https://api.qrserver.com/v1/create-qr-code/?size=1000x1000&data=" + q,
+        "https://goqr.me/api/?data=" + q + "&size=1000x1000"
+    ]
+
+
+def pay_check(order):
+    """Payment verify karo (check_payment API).
+    Returns True=paid, False=nahi mila, None=API error."""
+    oid = order.get("txn_id") or order.get("id")
+    amount = order.get("total", 0)
+    url = "{}?api_key={}&order_id={}&amount={}".format(
+        PAYMENT_API_URL, urllib.parse.quote(PAYMENT_API_KEY),
+        urllib.parse.quote(str(oid)), urllib.parse.quote(str(amount)))
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ViedietShop/1.0"
+            })
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+            print("[pay] {} -> {}".format(oid, str(res)[:120]))
+            st = str(res.get("status", "")).lower()
+            if st in ("success", "paid", "received", "completed", "confirmed"):
+                return True
+            if st in ("error", "failed", "pending", "not received"):
+                return False
+            return False
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            _print_error("pay_check", e)
+    return None
+
+
+def cb_check(cid, uid, oid, cb_id):
+    """'Check Payment' dabaya -> verify + auto deliver."""
+    answer_cb(cb_id, "Verifying...")
+    o = next((x for x in DATA["orders"] if x["id"] == oid and x["userId"] == uid), None)
+    if not o:
+        return send_message(cid, "😕 Order not found.",
+                            kb([[btn("🏠 Home", "home")]]))
+    if o["status"] != "pending":
+        return send_message(cid,
+                            "✅ Order <b>#{}</b> already handled: {}.\n"
+                            "My Orders mein codes + receipt dekh lo.".format(o["id"], status_label(o)),
+                            kb([[btn("📦 My Orders", "myorders")], [btn("🏠 Home", "home")]]))
+    if pay_check(o):
+        if auto_deliver(o):
+            return
+        return send_message(cid, "⚠️ Payment mil gayi lekin stock khatam - admin ko bata diya gaya.",
+                            kb([[btn("📦 My Orders", "myorders")]]))
+    send_message(cid,
+                 "⏳ <b>Payment abhi tak receive nahi hui.</b>\n\n"
+                 "🆔 Order: <b>#{}</b>\n"
+                 "💰 Amount: <b>{}</b>\n\n"
+                 "Jaisi hi payment aayegi, codes <b>AUTOMATICALLY</b> mil jayenge. "
+                 "Kuch bhi nahi karna - bas wait karo! 🔄".format(o["id"], money(o["total"])),
+                 kb([[btn("🔄 Check Payment", "check:" + o["id"], "primary", ICON_PRIMARY)],
+                     [btn("📦 My Orders", "myorders")]]))
+
+
+def payment_worker():
+    """Background thread - har interval mein pending orders verify karta hai.
+    Payment milte hi codes AUTO-DELIVER."""
+    last_check = {}
+    while True:
+        time.sleep(PAYMENT_CHECK_INTERVAL)
+        try:
+            now_ms = int(time.time() * 1000)
+            for o in DATA["orders"]:
+                if o.get("status") != "pending":
+                    continue
+                # payment karne ke liye thoda time do (15 sec)
+                if now_ms - o.get("at", 0) < 15000:
+                    continue
+                if now_ms - last_check.get(o["id"], 0) < PAYMENT_CHECK_INTERVAL * 1000:
+                    continue
+                last_check[o["id"]] = now_ms
+                if pay_check(o):
+                    print("[pay] Payment confirmed for order", o["id"])
+                    auto_deliver(o)
+        except Exception as e:
+            _print_error("pay_worker", e)
 
 
 # ============================================================
@@ -370,6 +567,7 @@ def create_order(uid, username, pid, qty):
     DATA["seq"]["order"] += 1
     order = {
         "id": "ORD" + str(DATA["seq"]["order"]).zfill(4),
+        "txn_id": pay_txn_id(),
         "userId": uid,
         "userName": username,
         "productId": pid,
@@ -394,11 +592,11 @@ def notify_admins(order):
            "👤 User: {} (id: {})\n"
            "🛍️ Product: {} x{}\n"
            "💰 Total: <b>{}</b>\n"
-           "🏦 UPI: <code>{}</code>\n"
-           "📊 Status: ⏳ Waiting payment").format(
+           "🆔 Txn: <code>{}</code>\n"
+           "📊 Status: ⏳ Auto-verify in process - payment aate hi codes deliver honge").format(
         order["id"], esc(order["userName"]), order["userId"],
         esc(order["productName"]), order["qty"], money(order["total"]),
-        esc(s["upi_id"]) if s.get("upi_id") else "-")
+        order.get("txn_id", "-"))
     for aid in DATA["admins"]:
         send_message(aid, cap)
 
@@ -504,9 +702,6 @@ def cb_pay(cid, uid, pid, cb_id, cb=None):
                             kb([[btn("◀️ Back to catalog", "shop")]]))
     s = setup()
     q = get_qty(uid, pid)
-    if not s.get("upi_id") and not s.get("qr_file_id"):
-        return send_message(cid, "⚠️ Payment methods not set up yet - try again later.",
-                            kb([[btn("◀️ Back to catalog", "shop")]]))
     if stock(p) < q:
         return send_message(cid, "⚠️ Only {} codes left in stock.".format(stock(p)),
                             kb([[btn("◀️ Back to catalog", "shop")]]))
@@ -571,10 +766,9 @@ def cb_pay_accept(cid, uid, pid, cb_id, cb=None):
            "1️⃣ Upar wala <b>QR scan</b> karein\n"
            "2️⃣ <b>Exact amount</b> ({}) pay karein\n"
            "3️⃣ <b>✅ I HAVE PAID</b> dabayein\n"
-           "4️⃣ 📸 Screenshot bhejein\n"
-           "5️⃣ 🎁 Verify hote hi <b>codes + receipt</b> mil jayenge!\n"
+           "4️⃣ Payment <b>AUTO-verify</b> hote hi codes mil jayenge 🎁\n"
            "{}\n"
-           "⚡ <b>Fastest Delivery</b> - thodi der mein codes mil jayenge!").format(
+           "⚡ <b>Fastest Delivery</b> - koi manual wait nahi, sab automatic!").format(
         order["id"], div(), esc(setup()["brand"]), div(),
         esc(p.get("name", "")), q, money(order["total"]), div(),
         money(order["total"]), div())
@@ -583,21 +777,24 @@ def cb_pay_accept(cid, uid, pid, cb_id, cb=None):
         [btn("📦 My Orders", "myorders")],
         [btn("❌ Cancel", "home", "danger", ICON_DANGER)]
     ]
-    if s.get("qr_file_id"):
-        sent = send_photo(cid, s["qr_file_id"], cap, kb(rows))
-        if sent is None and s.get("upi_id"):
-            send_message(cid, cap + "\n\n<i>⚠️ (QR image not available - UPI: <code>{}</code> se pay karein)</i>".format(esc(s["upi_id"])), kb(rows))
-    else:
-        if s.get("upi_id"):
-            send_message(cid, cap + "\n\n<i>UPI: <code>{}</code></i>".format(esc(s["upi_id"])), kb(rows))
-        else:
-            send_message(cid, cap, kb(rows))
+    qr_urls = pay_qr_urls(order["txn_id"], order["total"])
+    sent = send_photo_url(cid, qr_urls, cap, kb(rows))
+    if sent is None:
+        sent = send_photo(cid, qr_urls[0], cap, kb(rows))
+    if sent is None:
+        # Last resort: UPI ID text se pay karo (QR image fail hone par bhi)
+        send_message(cid, cap + "\n\n<i>⚠️ QR image load nahi hua. Direct UPI se pay karo:</i>\n"
+                                "<code>{}</code>\n\n"
+                                "🆔 Txn: <code>{}</code>\n"
+                                "<i>Agar txn ID UPI app mein maange toh ye daalo.</i>".format(
+                                    esc(PAY_UPI_ID), esc(order.get("txn_id", ""))),
+                     kb(rows))
     notify_admins(order)
 
 
 def cb_paid(cid, uid, pid, cb_id, uname="user"):
-    """STEP 3: user ne paid dabaya -> screenshot maango."""
-    answer_cb(cb_id, "Screenshot bhejo!")
+    """STEP 3: user ne paid dabaya -> AUTO-verify."""
+    answer_cb(cb_id, "Payment verify ho raha hai...")
     o = next((x for x in DATA["orders"]
               if x["userId"] == uid and x["productId"] == pid and x["status"] == "pending"), None)
     if not o:
@@ -610,16 +807,17 @@ def cb_paid(cid, uid, pid, cb_id, uname="user"):
             return
         o = create_order(uid, uname, pid, q)
         QTY_SEL.pop("{}:{}".format(uid, pid), None)
-    PENDING_SS[uid] = o["id"]
+    if pay_check(o):
+        if auto_deliver(o):
+            return
     send_message(cid,
-                 "📤 <b>Payment Screenshot bhejo!</b>\n"
-                 "━━━━━━━━━━━━━━━━━\n"
-                 "🆔 Order: <code>#{}</code>\n"
-                 "💰 Amount: <b>{}</b>\n"
-                 "━━━━━━━━━━━━━━━━━\n"
-                 "Apna payment screenshot <b>(photo)</b> yahan bhejein. 📸\n"
-                 "Admin verify karke <b>codes + receipt</b> bhej dega! 🎁".format(o["id"], money(o["total"])),
-                 kb([[btn("🚫 Screenshot nahi hai - Skip", "noss:" + o["id"])],
+                 "⏳ <b>Payment check kar rahe hain...</b>\n\n"
+                 "🆔 Order: <b>#{}</b>\n"
+                 "💰 Amount: <b>{}</b>\n\n"
+                 "Payment abhi tak receive nahi hui. Jaisi hi payment aayegi, "
+                 "codes <b>AUTOMATICALLY</b> mil jayenge - aapko kuch nahi karna. 🔄".format(
+                     o["id"], money(o["total"])),
+                 kb([[btn("🔄 Check Payment", "check:" + o["id"], "primary", ICON_PRIMARY)],
                      [btn("📦 My Orders", "myorders")]]))
 
 
@@ -958,6 +1156,8 @@ def handle_callback(upd):
         return cb_paid(cid, uid, data[5:], cb_id, uname)
     if data.startswith("noss:"):
         return cb_noss(cid, uid, data[5:], cb_id)
+    if data.startswith("check:"):
+        return cb_check(cid, uid, data[6:], cb_id)
 
     if not is_admin(uid):
         return answer_cb(cb_id, "Restricted")
@@ -1339,6 +1539,7 @@ def main():
         print("Open viediet_shop.py and set TOKEN and ADMIN_ID first.")
         return
     threading.Thread(target=_keepalive_http, daemon=True).start()
+    threading.Thread(target=payment_worker, daemon=True).start()
     print("Viediet Shop bot is running! (Ctrl+C to stop)")
     offset = DATA.get("poll_offset", 0)
     retry = 1
