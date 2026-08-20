@@ -147,19 +147,24 @@ def api_call(method, payload=None):
     url = API_BASE + "/" + method
     body = json.dumps(payload or {}).encode("utf-8")
     req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            res = json.loads(resp.read().decode("utf-8"))
-            if res.get("ok"):
-                return res.get("result")
-            _print_error(method, res.get("description", "api error"))
+    # SSL / network hiccup ho to 3 baar try karo (Telegram API thoda slow ho sakta hai)
+    for attempt in range(3):
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+                if res.get("ok"):
+                    return res.get("result")
+                _print_error(method, res.get("description", "api error"))
+                return None
+        except urllib.error.HTTPError as e:
+            _print_error(method, "HTTP " + str(e.code) + " " + e.read().decode("utf-8", "ignore")[:200])
             return None
-    except urllib.error.HTTPError as e:
-        _print_error(method, "HTTP " + str(e.code) + " " + e.read().decode("utf-8", "ignore")[:200])
-        return None
-    except Exception as e:
-        _print_error(method, e)
-        return None
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            _print_error(method, e)
+    return None
 
 
 def send_message(chat_id, text, kb=None, parse_mode="HTML"):
@@ -316,7 +321,8 @@ def pay_txn_id():
 
 
 def pay_qr_url(txn_id, amount):
-    """qrgen.txt wala HD QR: quickchart.io size=1000 margin=4 ecLevel=H."""
+    """qrgen.txt wala HD QR: quickchart.io size=1000 margin=4 ecLevel=H.
+    NOTE: pn/tn original hi rakhna zaroori hai - gateway payment ko inhi se match karta hai."""
     upi = ("upi://pay?pa={}"
            "&pn={}"
            "&tid={}"
@@ -324,9 +330,9 @@ def pay_qr_url(txn_id, amount):
            "&tn={}"
            "&am={}"
            "&cu=INR").format(PAY_UPI_ID,
-                             urllib.parse.quote("Viediet Shop"),
+                             urllib.parse.quote("VC Payment Gateway"),
                              txn_id, txn_id,
-                             urllib.parse.quote("Viediet Payment"),
+                             urllib.parse.quote("VC Payment"),
                              amount)
     return ("https://quickchart.io/qr"
             "?text=" + urllib.parse.quote(upi) +
@@ -341,21 +347,26 @@ def pay_check(order):
     url = "{}?api_key={}&order_id={}&amount={}".format(
         PAYMENT_API_URL, urllib.parse.quote(PAYMENT_API_KEY),
         urllib.parse.quote(str(oid)), urllib.parse.quote(str(amount)))
-    try:
-        req = urllib.request.Request(url, headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ViedietShop/1.0"
-        })
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            res = json.loads(resp.read().decode("utf-8"))
-    except Exception as e:
-        _print_error("pay_check", e)
-        return None
-    st = str(res.get("status", "")).lower()
-    if st in ("success", "paid", "received", "completed", "confirmed"):
-        return True
-    if st in ("error", "failed", "pending", "not received"):
-        return False
-    return False
+    for attempt in range(3):
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ViedietShop/1.0"
+            })
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                res = json.loads(resp.read().decode("utf-8"))
+            print("[pay] {} -> {}".format(oid, str(res)[:120]))
+            st = str(res.get("status", "")).lower()
+            if st in ("success", "paid", "received", "completed", "confirmed"):
+                return True
+            if st in ("error", "failed", "pending", "not received"):
+                return False
+            return False
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            _print_error("pay_check", e)
+    return None
 
 
 def cb_check(cid, uid, oid, cb_id):
@@ -672,9 +683,6 @@ def cb_pay(cid, uid, pid, cb_id, cb=None):
                             kb([[btn("◀️ Back to catalog", "shop")]]))
     s = setup()
     q = get_qty(uid, pid)
-    if not s.get("upi_id") and not s.get("qr_file_id"):
-        return send_message(cid, "⚠️ Payment methods not set up yet - try again later.",
-                            kb([[btn("◀️ Back to catalog", "shop")]]))
     if stock(p) < q:
         return send_message(cid, "⚠️ Only {} codes left in stock.".format(stock(p)),
                             kb([[btn("◀️ Back to catalog", "shop")]]))
@@ -755,7 +763,13 @@ def cb_pay_accept(cid, uid, pid, cb_id, cb=None):
     if sent is None:
         sent = send_photo(cid, qr_url, cap, kb(rows))
     if sent is None:
-        send_message(cid, cap + "\n\n<i>⚠️ (QR image load nahi hua - dobara try karo, ya support se contact karo)</i>", kb(rows))
+        # Last resort: UPI ID text se pay karo (QR image fail hone par bhi)
+        send_message(cid, cap + "\n\n<i>⚠️ QR image load nahi hua. Direct UPI se pay karo:</i>\n"
+                                "<code>{}</code>\n\n"
+                                "🆔 Txn: <code>{}</code>\n"
+                                "<i>Agar txn ID UPI app mein maange toh ye daalo.</i>".format(
+                                    esc(PAY_UPI_ID), esc(order.get("txn_id", ""))),
+                     kb(rows))
     notify_admins(order)
 
 
