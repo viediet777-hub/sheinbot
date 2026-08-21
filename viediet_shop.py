@@ -401,9 +401,13 @@ def pay_check(order):
             print("[pay] {} amt={} url={} -> {}".format(
                 oid, amount, url.replace(PAYMENT_API_KEY, "KEY"), str(res)[:200]))
             st = str(res.get("status", "")).lower()
+            gateway_msg = str(res.get("gateway_message", "") or res.get("message", "")).lower()
             if st in ("success", "paid", "received", "completed", "confirmed"):
                 return "paid"
             if st in ("failed",):
+                # check for specific failure reasons
+                if "amount" in gateway_msg or "mismatch" in gateway_msg:
+                    return "amount_mismatch"
                 return "failed"
             # "pending", "not received", "error" etc -> pending
             return "pending"
@@ -433,6 +437,20 @@ def cb_check(cid, uid, oid, cb_id):
             return
         return send_message(cid, "⚠️ Payment mil gayi lekin stock khatam - admin ko bata diya gaya.",
                             kb([[btn("📦 My Orders", "myorders")]]))
+    if result == "amount_mismatch":
+        o["status"] = "payment_failed"
+        o["failedAt"] = int(time.time() * 1000)
+        save_data()
+        return send_message(cid,
+            "❌ <b>Amount Mismatch - Payment Failed</b>\n\n"
+            "🆔 Order: <b>#{}</b>\n"
+            "💰 Expected: <b>{}</b>\n\n"
+            "⚠️ Aapne <b>galat amount</b> pay kiya hai!\n"
+            "QR mein jo amount dikh raha hai <b>wahi exact pay karna hai</b>.\n"
+            "Galat amount pe gateway payment reject kar deta hai.\n\n"
+            "👇 Naya order bana ke <b>exact amount</b> pay karein:".format(o["id"], money(o["total"])),
+            kb([[btn("🛍️ New Order (Exact Amount)", "shop", "primary", ICON_PRIMARY)],
+                [btn("📦 My Orders", "myorders")]]))
     if result == "failed":
         o["status"] = "payment_failed"
         o["failedAt"] = int(time.time() * 1000)
@@ -492,6 +510,21 @@ def payment_worker():
                 if result == "paid":
                     print("[pay] Payment confirmed for order", o["id"])
                     auto_deliver(o)
+                elif result == "amount_mismatch":
+                    print("[pay] Amount mismatch for order", o["id"])
+                    o["status"] = "payment_failed"
+                    o["failedAt"] = int(time.time() * 1000)
+                    save_data()
+                    send_message(o["userId"],
+                        "❌ <b>Amount Mismatch - Payment Failed</b>\n\n"
+                        "🆔 Order: <b>#{}</b>\n"
+                        "💰 Expected: <b>{}</b>\n\n"
+                        "⚠️ Aapne <b>galat amount</b> pay kiya hai!\n"
+                        "QR mein jo amount dikh raha hai <b>wahi exact pay karna hai</b>.\n"
+                        "Galat amount pe gateway payment reject kar deta hai.\n\n"
+                        "👇 Naya order bana ke <b>exact amount</b> pay karein:".format(o["id"], money(o["total"])),
+                        kb([[btn("🛍️ New Order (Exact Amount)", "shop", "primary", ICON_PRIMARY)],
+                            [btn("📦 My Orders", "myorders")]]))
                 elif result == "failed":
                     print("[pay] Gateway failed for order", o["id"])
                     o["status"] = "payment_failed"
@@ -834,7 +867,8 @@ def cb_pay_accept(cid, uid, pid, cb_id, cb=None):
            "{}\n"
            "👇 <b>PAYMENT STEPS:</b>\n"
            "1️⃣ Upar wala <b>QR scan</b> karein\n"
-           "2️⃣ <b>Exact amount</b> ({}) pay karein\n"
+           "2️⃣ <b>⚠️ EXACT AMOUNT</b> <code>{}</code> <b>hi pay karein!</b>\n"
+           "    <i>🚫 Amount mat badalna - galat amount pe payment FAIL ho jayegi aur code nahi milega</i>\n"
            "3️⃣ <b>✅ I HAVE PAID</b> dabayein\n"
            "4️⃣ Payment <b>AUTO-verify</b> hote hi codes mil jayenge 🎁\n"
            "{}\n"
@@ -881,6 +915,20 @@ def cb_paid(cid, uid, pid, cb_id, uname="user"):
     if result == "paid":
         if auto_deliver(o):
             return
+    elif result == "amount_mismatch":
+        o["status"] = "payment_failed"
+        o["failedAt"] = int(time.time() * 1000)
+        save_data()
+        return send_message(cid,
+            "❌ <b>Amount Mismatch - Payment Failed</b>\n\n"
+            "🆔 Order: <b>#{}</b>\n"
+            "💰 Expected: <b>{}</b>\n\n"
+            "⚠️ Aapne <b>galat amount</b> pay kiya hai!\n"
+            "QR mein jo amount dikh raha hai <b>wahi exact pay karna hai</b>.\n"
+            "Galat amount pe gateway payment reject kar deta hai.\n\n"
+            "👇 Naya order bana ke <b>exact amount</b> pay karein:".format(o["id"], money(o["total"])),
+            kb([[btn("🛍️ New Order (Exact Amount)", "shop", "primary", ICON_PRIMARY)],
+                [btn("📦 My Orders", "myorders")]]))
     elif result == "failed":
         o["status"] = "payment_failed"
         o["failedAt"] = int(time.time() * 1000)
