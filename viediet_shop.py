@@ -23,15 +23,8 @@ CURRENCY = "₹"
 SUPPORT_LINK = "https://t.me/viedietlooterschat"   # support group link
 
 # ============================================================
-# PAYMENT GATEWAY - AUTO VERIFICATION (API-based)
-# (QR auto-generate hota hai, payment auto-verify hota hai)
+# MANUAL QR PAYMENT (Admin sets QR in Settings)
 # ============================================================
-PAYMENT_API_KEY = os.environ.get("PAYMENT_API_KEY", "PAYB5854A51403EA6F080279257")
-PAY_UPI_ID = os.environ.get("PAY_UPI_ID", "paytm.s1dw5n0@pty")
-PAYMENT_API_URL = os.environ.get("PAYMENT_API_URL", "https://vcapi.vcstore.site/payment_api.php")
-PAYMENT_CHECK_INTERVAL = int(os.environ.get("PAYMENT_CHECK_INTERVAL", "15"))   # seconds
-PAYMENT_TIMEOUT_MIN = int(os.environ.get("PAYMENT_TIMEOUT_MIN", "10"))         # order cancel after X min pending
-
 API_BASE = "https://api.telegram.org/bot" + TOKEN
 # DATA_FILE: env variable "DATA_FILE" se override ho sakta hai (Railway volume ke liye).
 # Railway par volume mount karke DATA_FILE=/data/data.json set karo - data hamesha save rahega.
@@ -343,203 +336,14 @@ def upi_amount(n):
     return ("%.2f" % n).rstrip("0").rstrip(".")
 
 
-def pay_txn_id():
-    """Unique transaction id - QR aur API dono ke liye.
-    IMPORTANT: UPI spec mein tid max 15 chars hota hai. 'ORD'+13 digit
-    (16 chars) se apps tr drop kar dete hain -> gateway match nahi karta.
-    Isliye base36 use karke chhota (~11 chars) aur unique banate hain."""
-    _a = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    n = int(time.time() * 1000)
-    if getattr(pay_txn_id, "_last", 0) >= n:
-        n = pay_txn_id._last + 1
-    pay_txn_id._last = n
-    s = ""
-    while n:
-        n, r = divmod(n, 36)
-        s = _a[r] + s
-    return "ORD" + (s or "0")
-
-
-def pay_qr_urls(txn_id, amount):
-    """QR image ke MULTIPLE URL banao - agar ek fail ho toh doosra try hoga.
-    1st: quickchart.io (HD) / 2nd: api.qrserver.com / 3rd: goqr.me"""
-    amt = upi_amount(amount)
-    upi = ("upi://pay?pa={}"
-           "&pn={}"
-           "&tid={}"
-           "&tr={}"
-           "&tn={}"
-           "&am={}"
-           "&cu=INR").format(PAY_UPI_ID,
-                             urllib.parse.quote("VC Payment Gateway"),
-                             txn_id, txn_id,
-                             urllib.parse.quote("VC Payment"),
-                             amt)
-    q = urllib.parse.quote(upi)
-    return [
-        "https://quickchart.io/qr?text=" + q + "&size=1000&margin=4&ecLevel=H&format=png",
-        "https://api.qrserver.com/v1/create-qr-code/?size=1000x1000&data=" + q,
-        "https://goqr.me/api/?data=" + q + "&size=1000x1000"
-    ]
-
-
-def pay_check(order):
-    """Payment verify karo (check_payment API).
-    Returns: "paid" = success, "failed" = gateway failed, "pending" = not received yet, None = API error."""
-    oid = order.get("txn_id") or order.get("id")
-    amount = upi_amount(order.get("total", 0))
-    url = "{}?api_key={}&order_id={}&amount={}".format(
-        PAYMENT_API_URL, urllib.parse.quote(PAYMENT_API_KEY),
-        urllib.parse.quote(str(oid)), urllib.parse.quote(str(amount)))
-    for attempt in range(3):
-        try:
-            req = urllib.request.Request(url, headers={
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) ViedietShop/1.0"
-            })
-            with urllib.request.urlopen(req, timeout=20) as resp:
-                res = json.loads(resp.read().decode("utf-8"))
-            print("[pay] {} amt={} url={} -> {}".format(
-                oid, amount, url.replace(PAYMENT_API_KEY, "KEY"), str(res)[:200]))
-            st = str(res.get("status", "")).lower()
-            gateway_msg = str(res.get("gateway_message", "") or res.get("message", "")).lower()
-            if st in ("success", "paid", "received", "completed", "confirmed"):
-                return "paid"
-            if st in ("failed",):
-                # check for specific failure reasons
-                if "amount" in gateway_msg or "mismatch" in gateway_msg:
-                    return "amount_mismatch"
-                return "failed"
-            # "pending", "not received", "error" etc -> pending
-            return "pending"
-        except Exception as e:
-            if attempt < 2:
-                time.sleep(2 * (attempt + 1))
-                continue
-            _print_error("pay_check", e)
-    return None
-
-
-def cb_check(cid, uid, oid, cb_id):
-    """'Check Payment' dabaya -> verify + auto deliver."""
-    answer_cb(cb_id, "Verifying...")
-    o = next((x for x in DATA["orders"] if x["id"] == oid and x["userId"] == uid), None)
-    if not o:
-        return send_message(cid, "😕 Order not found.",
-                            kb([[btn("🏠 Home", "home")]]))
-    if o["status"] != "pending":
-        return send_message(cid,
-                            "✅ Order <b>#{}</b> already handled: {}.\n"
-                            "My Orders mein codes + receipt dekh lo.".format(o["id"], status_label(o)),
-                            kb([[btn("📦 My Orders", "myorders")], [btn("🏠 Home", "home")]]))
-    result = pay_check(o)
-    if result == "paid":
-        if auto_deliver(o):
-            return
-        return send_message(cid, "⚠️ Payment mil gayi lekin stock khatam - admin ko bata diya gaya.",
-                            kb([[btn("📦 My Orders", "myorders")]]))
-    if result == "amount_mismatch":
-        o["status"] = "payment_failed"
-        o["failedAt"] = int(time.time() * 1000)
-        save_data()
-        return send_message(cid,
-            "❌ <b>Amount Mismatch - Payment Failed</b>\n\n"
-            "🆔 Order: <b>#{}</b>\n"
-            "💰 Expected: <b>{}</b>\n\n"
-            "⚠️ Aapne <b>galat amount</b> pay kiya hai!\n"
-            "QR mein jo amount dikh raha hai <b>wahi exact pay karna hai</b>.\n"
-            "Galat amount pe gateway payment reject kar deta hai.\n\n"
-            "👇 Naya order bana ke <b>exact amount</b> pay karein:".format(o["id"], money(o["total"])),
-            kb([[btn("🛍️ New Order (Exact Amount)", "shop", "primary", ICON_PRIMARY)],
-                [btn("📦 My Orders", "myorders")]]))
-    if result == "failed":
-        o["status"] = "payment_failed"
-        o["failedAt"] = int(time.time() * 1000)
-        save_data()
-        return send_message(cid,
-            "❌ <b>Payment Failed / Cancelled</b>\n\n"
-            "🆔 Order: <b>#{}</b>\n"
-            "💰 Amount: <b>{}</b>\n\n"
-            "Gateway ne payment reject kiya (insufficient funds / timeout / cancelled).\n"
-            "👇 Naya order bana ke dobara try karein:".format(o["id"], money(o["total"])),
-            kb([[btn("🛍️ New Order", "shop", "primary", ICON_PRIMARY)],
-                [btn("📦 My Orders", "myorders")]]))
-    send_message(cid,
-                 "⏳ <b>Payment abhi tak receive nahi hui.</b>\n\n"
-                 "🆔 Order: <b>#{}</b>\n"
-                 "💰 Amount: <b>{}</b>\n\n"
-                 "Jaisi hi payment aayegi, codes <b>AUTOMATICALLY</b> mil jayenge. "
-                 "Kuch bhi nahi karna - bas wait karo! 🔄".format(o["id"], money(o["total"])),
-                 kb([[btn("🔄 Check Payment", "check:" + o["id"], "primary", ICON_PRIMARY)],
-                     [btn("📦 My Orders", "myorders")]]))
-
-
-def payment_worker():
-    """Background thread - har interval mein pending orders verify karta hai.
-    Payment milte hi codes AUTO-DELIVER. Agar gateway failed bole to user notify karo.
-    Timeout ke baad order auto-cancel hota hai."""
-    last_check = {}
-    timeout_ms = PAYMENT_TIMEOUT_MIN * 60 * 1000
-    while True:
-        time.sleep(PAYMENT_CHECK_INTERVAL)
-        try:
-            now_ms = int(time.time() * 1000)
-            for o in DATA["orders"]:
-                if o.get("status") != "pending":
-                    continue
-                # timeout check - order purana ho gaya, cancel karo
-                if now_ms - o.get("at", 0) > timeout_ms:
-                    o["status"] = "timeout"
-                    o["timeoutAt"] = int(time.time() * 1000)
-                    save_data()
-                    send_message(o["userId"],
-                        "⏰ <b>Order Expired</b>\n\n"
-                        "🆔 Order: <b>#{}</b>\n"
-                        "💰 Amount: <b>{}</b>\n\n"
-                        "{} minute tak payment nahi aayi. Order auto-cancel ho gaya.\n"
-                        "👇 Naya order bana ke dobara try karein:".format(
-                            o["id"], money(o["total"]), PAYMENT_TIMEOUT_MIN),
-                        kb([[btn("🛍️ New Order", "shop", "primary", ICON_PRIMARY)],
-                            [btn("📦 My Orders", "myorders")]]))
-                    continue
-                if now_ms - o.get("at", 0) < 15000:
-                    continue
-                if now_ms - last_check.get(o["id"], 0) < PAYMENT_CHECK_INTERVAL * 1000:
-                    continue
-                last_check[o["id"]] = now_ms
-                result = pay_check(o)
-                if result == "paid":
-                    print("[pay] Payment confirmed for order", o["id"])
-                    auto_deliver(o)
-                elif result == "amount_mismatch":
-                    print("[pay] Amount mismatch for order", o["id"])
-                    o["status"] = "payment_failed"
-                    o["failedAt"] = int(time.time() * 1000)
-                    save_data()
-                    send_message(o["userId"],
-                        "❌ <b>Amount Mismatch - Payment Failed</b>\n\n"
-                        "🆔 Order: <b>#{}</b>\n"
-                        "💰 Expected: <b>{}</b>\n\n"
-                        "⚠️ Aapne <b>galat amount</b> pay kiya hai!\n"
-                        "QR mein jo amount dikh raha hai <b>wahi exact pay karna hai</b>.\n"
-                        "Galat amount pe gateway payment reject kar deta hai.\n\n"
-                        "👇 Naya order bana ke <b>exact amount</b> pay karein:".format(o["id"], money(o["total"])),
-                        kb([[btn("🛍️ New Order (Exact Amount)", "shop", "primary", ICON_PRIMARY)],
-                            [btn("📦 My Orders", "myorders")]]))
-                elif result == "failed":
-                    print("[pay] Gateway failed for order", o["id"])
-                    o["status"] = "payment_failed"
-                    o["failedAt"] = int(time.time() * 1000)
-                    save_data()
-                    send_message(o["userId"],
-                        "❌ <b>Payment Failed / Cancelled</b>\n\n"
-                        "🆔 Order: <b>#{}</b>\n"
-                        "💰 Amount: <b>{}</b>\n\n"
-                        "Gateway ne payment reject kiya (insufficient funds / timeout / cancelled).\n"
-                        "👇 Naya order bana ke dobara try karein:".format(o["id"], money(o["total"])),
-                        kb([[btn("🛍️ New Order", "shop", "primary", ICON_PRIMARY)],
-                            [btn("📦 My Orders", "myorders")]]))
-        except Exception as e:
-            _print_error("pay_worker", e)
+# ============================================================
+# ============================================================
+# MANUAL QR PAYMENT (no auto gateway)
+# ============================================================
+def get_manual_qr():
+    """Admin panel se set manual QR return karta hai."""
+    s = setup()
+    return s.get("qr_file_id") or s.get("upi_id") or None
 
 
 # ============================================================
@@ -881,24 +685,26 @@ def cb_pay_accept(cid, uid, pid, cb_id, cb=None):
         [btn("📦 My Orders", "myorders")],
         [btn("❌ Cancel", "home", "danger", ICON_DANGER)]
     ]
-    qr_urls = pay_qr_urls(order["txn_id"], order["total"])
-    sent = send_photo_url(cid, qr_urls, cap, kb(rows))
-    if sent is None:
-        sent = send_photo(cid, qr_urls[0], cap, kb(rows))
-    if sent is None:
-        # Last resort: UPI ID text se pay karo (QR image fail hone par bhi)
-        send_message(cid, cap + "\n\n<i>⚠️ QR image load nahi hua. Direct UPI se pay karo:</i>\n"
-                                "<code>{}</code>\n\n"
-                                "🆔 Txn: <code>{}</code>\n"
-                                "<i>Agar txn ID UPI app mein maange toh ye daalo.</i>".format(
-                                    esc(PAY_UPI_ID), esc(order.get("txn_id", ""))),
-                     kb(rows))
+# Manual QR bhejo
+    manual_qr = get_manual_qr()
+    if manual_qr:
+        # Agar file_id hai toh sendPhoto, warna UPI ID text
+        if manual_qr.startswith("AgAC") or manual_qr.startswith("AQAC"):  # Telegram file_id
+            sent = send_photo(cid, manual_qr, cap, kb(rows))
+        else:
+            # UPI ID text
+            send_message(cid, cap + "\n\n<b>UPI ID:</b> <code>{}</code>\n\nQR admin panel se set karein.".format(esc(manual_qr)), kb(rows))
+    else:
+        # QR nahi set hai - UPI ID dikhao
+        s = setup()
+        upi = s.get("upi_id", "Not set")
+        send_message(cid, cap + "\n\n<b>UPI ID:</b> <code>{}</code>\n\n<b>⚠️ Admin: Settings → QR Image/UPI ID set karein</b>".format(esc(upi)), kb(rows))
     notify_admins(order)
 
 
 def cb_paid(cid, uid, pid, cb_id, uname="user"):
-    """STEP 3: user ne paid dabaya -> AUTO-verify."""
-    answer_cb(cb_id, "Payment verify ho raha hai...")
+    """User ne 'I HAVE PAID' dabaya - admin ko notify karo manual verify ke liye."""
+    answer_cb(cb_id, "Admin ko notify kar diya gaya hai...")
     o = next((x for x in DATA["orders"]
               if x["userId"] == uid and x["productId"] == pid and x["status"] == "pending"), None)
     if not o:
@@ -911,45 +717,15 @@ def cb_paid(cid, uid, pid, cb_id, uname="user"):
             return
         o = create_order(uid, uname, pid, q)
         QTY_SEL.pop("{}:{}".format(uid, pid), None)
-    result = pay_check(o)
-    if result == "paid":
-        if auto_deliver(o):
-            return
-    elif result == "amount_mismatch":
-        o["status"] = "payment_failed"
-        o["failedAt"] = int(time.time() * 1000)
-        save_data()
-        return send_message(cid,
-            "❌ <b>Amount Mismatch - Payment Failed</b>\n\n"
-            "🆔 Order: <b>#{}</b>\n"
-            "💰 Expected: <b>{}</b>\n\n"
-            "⚠️ Aapne <b>galat amount</b> pay kiya hai!\n"
-            "QR mein jo amount dikh raha hai <b>wahi exact pay karna hai</b>.\n"
-            "Galat amount pe gateway payment reject kar deta hai.\n\n"
-            "👇 Naya order bana ke <b>exact amount</b> pay karein:".format(o["id"], money(o["total"])),
-            kb([[btn("🛍️ New Order (Exact Amount)", "shop", "primary", ICON_PRIMARY)],
-                [btn("📦 My Orders", "myorders")]]))
-    elif result == "failed":
-        o["status"] = "payment_failed"
-        o["failedAt"] = int(time.time() * 1000)
-        save_data()
-        return send_message(cid,
-            "❌ <b>Payment Failed / Cancelled</b>\n\n"
-            "🆔 Order: <b>#{}</b>\n"
-            "💰 Amount: <b>{}</b>\n\n"
-            "Gateway ne payment reject kiya (insufficient funds / timeout / cancelled).\n"
-            "👇 Naya order bana ke dobara try karein:".format(o["id"], money(o["total"])),
-            kb([[btn("🛍️ New Order", "shop", "primary", ICON_PRIMARY)],
-                [btn("📦 My Orders", "myorders")]]))
+    # Admin ko notify with screenshot request
+    notify_paid(o, None)
     send_message(cid,
-                 "⏳ <b>Payment check kar rahe hain...</b>\n\n"
-                 "🆔 Order: <b>#{}</b>\n"
-                 "💰 Amount: <b>{}</b>\n\n"
-                 "Payment abhi tak receive nahi hui. Jaisi hi payment aayegi, "
-                 "codes <b>AUTOMATICALLY</b> mil jayenge - aapko kuch nahi karna. 🔄".format(
-                     o["id"], money(o["total"])),
-                 kb([[btn("🔄 Check Payment", "check:" + o["id"], "primary", ICON_PRIMARY)],
-                     [btn("📦 My Orders", "myorders")]]))
+        "✅ <b>Payment Claim Submitted!</b>\n\n"
+        "🆔 Order: <b>#{}</b>\n"
+        "💰 Amount: <b>{}</b>\n\n"
+        "Admin aapka payment verify karega. Verify hote hi codes mil jayenge.\n"
+        "Kripya wait karein... 🔄".format(o["id"], money(o["total"])),
+        kb([[btn("📦 My Orders", "myorders")], [btn("🏠 Home", "home")]]))
 
 
 def cb_noss(cid, uid, oid, cb_id):
@@ -1670,7 +1446,6 @@ def main():
         print("Open viediet_shop.py and set TOKEN and ADMIN_ID first.")
         return
     threading.Thread(target=_keepalive_http, daemon=True).start()
-    threading.Thread(target=payment_worker, daemon=True).start()
     print("Viediet Shop bot is running! (Ctrl+C to stop)")
     offset = DATA.get("poll_offset", 0)
     retry = 1
