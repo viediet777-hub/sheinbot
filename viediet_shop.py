@@ -685,7 +685,7 @@ def cb_pay_accept(cid, uid, pid, cb_id, cb=None):
         [btn("📦 My Orders", "myorders")],
         [btn("❌ Cancel", "home", "danger", ICON_DANGER)]
     ]
-# Manual QR bhejo
+    # Manual QR bhejo
     manual_qr = get_manual_qr()
     if manual_qr:
         # Agar file_id hai toh sendPhoto, warna UPI ID text
