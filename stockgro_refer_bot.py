@@ -44,7 +44,7 @@ from telegram.ext import (
 # ============================ CONFIG ============================
 # Values can be set via environment variables (required for Railway).
 # Fallback to hardcoded values for local run.
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8812724251:AAFWjNmEGAFUd6d425z0xsirAj2U-kR7n_s")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 
 def _parse_admins() -> set[int]:
     raw = os.getenv("ADMIN_IDS", "")
@@ -60,9 +60,9 @@ def _parse_admins() -> set[int]:
     return ids
 
 ADMIN_IDS = _parse_admins()
-BOT_USERNAME_FALLBACK = os.getenv("BOT_USERNAME", "@Tesetingorder_bot")
+BOT_USERNAME_FALLBACK = os.getenv("BOT_USERNAME", "@Stockgrorefer_bot")
 
-DEFAULT_STOCKGRO_CODE = os.getenv("DEFAULT_STOCKGRO_CODE", "NIP8OG9M")
+DEFAULT_STOCKGRO_CODE = os.getenv("DEFAULT_STOCKGRO_CODE", "")
 
 # Force-join channel (overridable via env for Railway)
 DEFAULT_FORCE_CHANNEL = os.getenv("FORCE_CHANNEL", "@viedietlooters")
