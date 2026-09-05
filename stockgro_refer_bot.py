@@ -819,6 +819,8 @@ def checker_report(fb_url: str, fb_key: str, proxy: str | None = None) -> str:
 # ============================ JOB (runs in a thread, serial) ============================
 def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str,
                      refcode: str, proxy: str | None):
+    status_id: list = [None]  # live tracker message id (list = mutable in closure)
+
     def say(text: str):
         try:
             fut = asyncio.run_coroutine_threadsafe(
@@ -827,10 +829,33 @@ def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str
         except Exception as e:
             log.warning("progress send fail: %s", e)
 
+    def progress_bar(done: int, total: int, width: int = 10) -> str:
+        if not total:
+            return "░" * width
+        fill = min(width, int(done / total * width))
+        return "█" * fill + "░" * (width - fill)
+
+    def set_status(text: str):
+        """Create once, then edit the same message: live progress tracker."""
+        try:
+            if status_id[0] is None:
+                fut = asyncio.run_coroutine_threadsafe(
+                    bot.send_message(chat_id, text, parse_mode="Markdown"), loop)
+                msg = fut.result(timeout=20)
+                status_id[0] = msg.message_id
+            else:
+                fut = asyncio.run_coroutine_threadsafe(
+                    bot.edit_message_text(chat_id=chat_id, message_id=status_id[0],
+                                          text=text, parse_mode="Markdown"), loop)
+                fut.result(timeout=15)
+        except Exception as e:
+            log.warning("status edit fail: %s", str(e)[:150])
+
     host = fb_host(fb_url)
     proxy = ensure_proxy(proxy)  # dead proxy = 0 success, so validate first
     log.info("job uid=%s host=%s via %s", uid, host, proxy_label(proxy) if proxy else "direct")
-    say(f"*Your turn started.*\nHost: `{host}`\nScanning numbers. Please wait.")
+    set_status(f"*LIVE PROGRESS*\n------------------------\n"
+               f"Host: `{host}`\nStep: Scanning Firebase for numbers...")
     _devices, order, panel = collect_numbers(fb_url, fb_key, proxy)
     fresh = []
     for ph, dev in order:
@@ -848,12 +873,20 @@ def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str
             "All numbers are already used. Check with the Checker first.")
         return
     say(f"Found *{len(fresh)}* fresh number(s). Starting auto refers.")
+    total = len(fresh)
     tried, success = 0, []
     rl_hits = 0
+
+    def show(num: int, phone: str, step: str):
+        set_status(f"*LIVE PROGRESS*\n------------------------\n"
+                   f"Host: `{host}`\n"
+                   f"Progress: [{progress_bar(num - 1, total)}] *{num - 1}/{total}* | Success: *{len(success)}*\n"
+                   f"Current: `{phone}`\nStep: {step}")
 
     for ph, dev_id in fresh:
         try:
             tried += 1
+            show(tried, ph, "Checking number...")
             name = f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}"
             d, _st, err = call_with_state(
                 lambda st: sg_post(f"{BASE_URL}/getIdentity",
@@ -871,7 +904,9 @@ def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str
                 continue
             if d["data"].get("existing_user"):
                 save_success(ph, uid, "ALREADY_REGISTERED", "-", refcode)
+                show(tried, ph, "Skipped - already registered.")
                 continue
+            show(tried, ph, "Number is new. Sending OTP...")
             last_key = get_last_message_key(fb_url, fb_key, dev_id, proxy) if dev_id else ""
             time.sleep(2)
             dc, sdata, derr = call_with_state(
@@ -887,12 +922,20 @@ def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str
                         break
                     say("*Rate limited.* Waiting 60s, then continuing with the next number.")
                     time.sleep(60)
+                show(tried, ph, "OTP failed to send. Moving on.")
                 continue
-                say(f"SMS sent to `{ph}`. Waiting for auto OTP (up to {OTP_TIMEOUT}s).")
+            try:
+                sess_id = dc["data"]["session_id"]
+            except (TypeError, KeyError):
+                show(tried, ph, "OTP failed to send. Moving on.")
+                continue
+            sdata = {"session_id": sess_id, "state": sdata}
+            show(tried, ph, f"OTP sent. Waiting for auto OTP (up to {OTP_TIMEOUT}s)...")
             otp = poll_otp_numbers_node(fb_url, fb_key, ph, proxy, OTP_TIMEOUT)
             if not otp and dev_id:
                 otp = poll_for_stockgro_otp(fb_url, fb_key, dev_id, last_key, proxy, OTP_TIMEOUT)
             if not otp:
+                show(tried, ph, "No OTP received. Moving on.")
                 continue
             # Fresh state for validate+register (real file does the same:
             # the old state expires during the OTP wait -> CLIENT_STATE_EXPIRE).
@@ -906,11 +949,13 @@ def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str
                             vheaders, proxy)
             except Exception as e:
                 log.warning("validate state refresh fail: %s", e)
+            show(tried, ph, "OTP received. Registering...")
             v = sg_post(f"{BASE_URL}/login/validateOtp",
                         {"session_id": sdata["session_id"], "otp": otp, "phone_number": ph,
                          "country_code": "IN", "otp_channel": "sms", "flow_type": "signup"},
                         vheaders, proxy)
             if not v or not v.get("success"):
+                show(tried, ph, "OTP verification failed. Moving on.")
                 continue
             r = sg_post(f"{BASE_URL}/signup/registerUser",
                         {"display_name": name, "invitation_code": refcode, "otp": otp,
@@ -918,11 +963,12 @@ def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str
                          "phone_number": ph, "country_code": "IN", "otp_channel": "sms"},
                         vheaders, proxy)
             if not r or not r.get("success"):
+                show(tried, ph, "Registration failed. Moving on.")
                 continue
             sg_uid = r.get("data", {}).get("user_id", "")
             save_success(ph, uid, name, sg_uid, refcode)
             success.append((ph, name))
-            say(f"*Success {len(success)}:* `{ph}` registered as *{name}*.")
+            show(tried, ph, f"Registered as *{name}*.")
         except Exception as e:
             # one bad number must never kill the whole job
             log.warning("job number %s failed: %s", ph, str(e)[:200])
@@ -930,6 +976,10 @@ def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str
     record_job(uid, host, tried, len(success), "done")
     u = get_user(uid)
     bal = u["points"] if u else 0
+    set_status(f"*LIVE PROGRESS*\n------------------------\n"
+               f"Host: `{host}`\n"
+               f"Progress: [{progress_bar(total, total)}] *{total}/{total}* | Success: *{len(success)}*\n"
+               "Step: Finished.")
     say(f"*Job finished.*\nTried: *{tried}* | Success: *{len(success)}*\nBalance: *{bal}* points.")
 
 
