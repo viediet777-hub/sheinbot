@@ -1,0 +1,11 @@
+[project]
+name = "stockgro-refer-bot"
+description = "StockGro referral + OTP Telegram bot (points-based, force-join, admin panel)"
+authors = ["viediet"]
+
+[build]
+builder = "nixpacks"
+
+[deploy]
+startCommand = "python stockgro_refer_bot.py"
+restart = true

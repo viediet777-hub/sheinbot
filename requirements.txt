@@ -1,3 +1,2 @@
-pyTelegramBotAPI
-pytesseract
-Pillow
+python-telegram-bot>=22.7,<23
+requests>=2.31
