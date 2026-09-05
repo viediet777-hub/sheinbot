@@ -61,7 +61,7 @@ DEFAULT_FORCE_LINK = os.getenv("FORCE_CHANNEL_LINK", "https://t.me/viedietlooter
 POINTS_PER_REFER = int(os.getenv("POINTS_PER_REFER_FB", "2"))
 COST_PER_JOB = int(os.getenv("COST_PER_JOB", "1"))
 BONUS_ON_START = int(os.getenv("BONUS_ON_START_FB", "1"))
-MAX_NUMBERS_PER_JOB = int(os.getenv("MAX_NUMBERS_PER_JOB", "5"))
+MAX_NUMBERS_PER_JOB = int(os.getenv("MAX_NUMBERS_PER_JOB", "0"))  # 0 = no limit, all fresh numbers
 OTP_TIMEOUT = int(os.getenv("OTP_TIMEOUT", "40"))
 SPAM_COOLDOWN_SEC = 1.5
 
@@ -110,6 +110,15 @@ def _split_proxy_source(raw: str) -> list[str]:
             if p.strip() and not p.strip().startswith("#")]
 
 
+def _proxy_has_auth(entry: str) -> bool:
+    e = (entry or "").strip()
+    if "@" in e:
+        return True
+    if "://" not in e and e.count(":") == 3:  # host:port:user:pass
+        return True
+    return False
+
+
 def load_proxy_pool() -> list[str]:
     global _PROXY_POOL
     if _PROXY_POOL is not None:
@@ -123,6 +132,8 @@ def load_proxy_pool() -> list[str]:
             entries = _split_proxy_source(PROXY_FILE.read_text(encoding="utf-8"))
         except Exception as e:
             log.warning("could not read proxies.txt: %s", e)
+    # reliable (paid/auth) proxies first, free ones last
+    entries.sort(key=lambda e: 0 if _proxy_has_auth(e) else 1)
     _PROXY_POOL = entries
     log.info("proxy pool loaded: %d entries", len(entries))
     return entries
@@ -161,7 +172,41 @@ def pick_proxy() -> str | None:
     pool = load_proxy_pool()
     if not pool:
         return None
-    return random.choice(pool)
+    auth = [e for e in pool if _proxy_has_auth(e)]
+    return random.choice(auth or pool)  # paid/auth proxies preferred
+
+
+def proxy_alive(entry: str | None, timeout: int = 8) -> bool:
+    """Fast healthcheck: can this route reach StockGro at all?"""
+    try:
+        r = requests.get("https://app.stockgro.club", headers={
+            "user-agent": "Mozilla/5.0 (Linux; Android 14; SM-A135F) AppleWebKit/537.36 "
+                          "Chrome/151.0.7922.169 Mobile Safari/537.36"},
+            timeout=timeout, proxies=proxy_dicts(entry))
+        return r.status_code == 200
+    except Exception:
+        return False
+
+
+def ensure_proxy(preferred: str | None) -> str | None:
+    """Validate the job's proxy; fail over to other pool entries, else direct.
+    A dead proxy used to kill the whole job with 0 success."""
+    if PROXY_MODE == "off":
+        return None
+    tried = set()
+    candidates = [preferred] if preferred else []
+    candidates += [e for e in load_proxy_pool() if e != preferred]
+    for entry in candidates[:4]:
+        if entry in tried:
+            continue
+        tried.add(entry)
+        if proxy_alive(entry):
+            if entry != preferred:
+                log.info("proxy failover: %s -> %s", proxy_label(preferred), proxy_label(entry))
+            return entry
+        log.warning("dead proxy skipped: %s", proxy_label(entry))
+    log.warning("no working proxy, falling back to direct")
+    return None
 
 
 def proxy_dicts(entry: str | None) -> dict | None:
@@ -723,7 +768,7 @@ def checker_report(fb_url: str, fb_key: str, proxy: str | None = None) -> str:
 
 # ============================ JOB (runs in a thread, serial) ============================
 def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str,
-                     refcode: str, proxy: str | None, max_numbers: int):
+                     refcode: str, proxy: str | None):
     def say(text: str):
         try:
             fut = asyncio.run_coroutine_threadsafe(
@@ -733,9 +778,13 @@ def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str
             log.warning("progress send fail: %s", e)
 
     host = fb_host(fb_url)
+    proxy = ensure_proxy(proxy)  # dead proxy = 0 success, so validate first
+    log.info("job uid=%s host=%s via %s", uid, host, proxy_label(proxy) if proxy else "direct")
     say(f"*Your turn started.*\nHost: `{host}`\nScanning numbers. Please wait.")
     _devices, order = collect_numbers(fb_url, fb_key, proxy)
-    fresh = [(ph, dev) for ph, dev in order if not is_number_used(ph)][:max_numbers]
+    fresh = [(ph, dev) for ph, dev in order if not is_number_used(ph)]
+    if MAX_NUMBERS_PER_JOB > 0:
+        fresh = fresh[:MAX_NUMBERS_PER_JOB]
     if not fresh:
         record_job(uid, host, 0, 0, "no_fresh_numbers")
         say("No fresh numbers found on this Firebase.\n"
@@ -858,7 +907,7 @@ async def queue_worker(app: Application):
         try:
             await asyncio.to_thread(run_firebase_job, app.bot, loop, job["uid"],
                                     job["uid"], job["fb_url"], job["fb_key"],
-                                    job["refcode"], job["proxy"], MAX_NUMBERS_PER_JOB)
+                                    job["refcode"], job["proxy"])
         except Exception as e:
             log.error("job crash uid=%s: %s", job["uid"], e)
             try:
@@ -1096,7 +1145,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                            "`https://xxx.firebaseio.com`\n"
                            "If it needs a key: `URL ||| KEY`\n\n"
                            f"Active refer code: `{code_now}` (change via Set Refer Code).\n"
-                           f"Up to *{MAX_NUMBERS_PER_JOB}* fresh numbers will be processed automatically.\n"
+                           f"All fresh numbers will be processed automatically.\n"
                            "Send /cancel to cancel.",
                         parse_mode="Markdown",
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="m_back")]]))
