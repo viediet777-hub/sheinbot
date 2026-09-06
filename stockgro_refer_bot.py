@@ -52,9 +52,9 @@ def _parse_admins() -> set[int]:
 
 
 ADMIN_IDS = _parse_admins()
-BOT_USERNAME_FALLBACK = os.getenv("BOT_USERNAME_FB", "@Stockgrorefer_bot")
+BOT_USERNAME_FALLBACK = os.getenv("BOT_USERNAME_FB", "")
 
-DEFAULT_STOCKGRO_CODE = os.getenv("DEFAULT_STOCKGRO_CODE", "") or ""
+DEFAULT_STOCKGRO_CODE = os.getenv("DEFAULT_STOCKGRO_CODE", "NIP8OG9M") or "NIP8OG9M"
 DEFAULT_FORCE_CHANNEL = os.getenv("FORCE_CHANNEL", "@viedietlooters")
 DEFAULT_FORCE_LINK = os.getenv("FORCE_CHANNEL_LINK", "https://t.me/viedietlooters")
 
@@ -290,6 +290,11 @@ def init_db():
             numbers_success INTEGER DEFAULT 0,
             status TEXT,
             created_at TEXT
+        )""")
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS settings(
+            key TEXT PRIMARY KEY,
+            value TEXT
         )""")
     cur.execute("DELETE FROM channels WHERE chat_id IN ('@viedietloots','viedietloots')")
     cur.execute("INSERT OR IGNORE INTO channels(chat_id, link) VALUES(?,?)",
@@ -983,17 +988,91 @@ def run_firebase_job(bot, loop, chat_id: int, uid: int, fb_url: str, fb_key: str
     say(f"*Job finished.*\nTried: *{tried}* | Success: *{len(success)}*\nBalance: *{bal}* points.")
 
 
-# ============================ QUEUE (serial, one user at a time) ============================
+# ============================ QUEUE MODES ============================
+# serial   = one user at a time, rest wait in queue
+# parallel = everyone's job starts instantly, all run together
+_QUEUE_MODE = os.getenv("QUEUE_MODE", "parallel")
+if _QUEUE_MODE not in ("serial", "parallel"):
+    _QUEUE_MODE = "parallel"
+
+
+def get_setting(key: str, default: str = "") -> str:
+    try:
+        con = db()
+        row = con.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        con.close()
+        if row:
+            return row["value"]
+    except Exception:
+        pass
+    return default
+
+
+def set_setting(key: str, value: str):
+    con = db()
+    con.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?,?)", (key, value))
+    con.commit()
+    con.close()
+
+
+def get_queue_mode() -> str:
+    return _QUEUE_MODE if _QUEUE_MODE in ("serial", "parallel") else "parallel"
+
+
+def set_queue_mode(mode: str) -> str:
+    global _QUEUE_MODE
+    mode = (mode or "").lower()
+    if mode not in ("serial", "parallel"):
+        mode = "parallel" if _QUEUE_MODE == "serial" else "serial"  # toggle
+    _QUEUE_MODE = mode
+    try:
+        set_setting("queue_mode", mode)
+    except Exception as e:
+        log.warning("mode persist fail: %s", e)
+    return _QUEUE_MODE
+
+
+# ============================ QUEUE / PARALLEL ENGINE ============================
+_APP = None
 _QUEUE: deque = deque()
 _QUEUE_LOCK = asyncio.Lock()
-_ACTIVE_UID: int | None = None
+_ACTIVE: set[int] = set()
+
+
+async def _execute_job(app: Application, job: dict):
+    _ACTIVE.add(job["uid"])
+    try:
+        try:
+            await app.bot.send_message(job["uid"], "*Your turn started.*", parse_mode="Markdown")
+        except Exception:
+            pass
+        loop = asyncio.get_running_loop()
+        try:
+            await asyncio.to_thread(run_firebase_job, app.bot, loop, job["uid"],
+                                    job["uid"], job["fb_url"], job["fb_key"],
+                                    job["refcode"], job["proxy"])
+        except Exception as e:
+            log.error("job crash uid=%s: %s", job["uid"], e)
+            try:
+                await app.bot.send_message(job["uid"], "Job stopped due to an error. Contact admin.")
+            except Exception:
+                pass
+    finally:
+        _ACTIVE.discard(job["uid"])
+
+
+def _make_job(uid, fb_url, fb_key, refcode, proxy) -> dict:
+    return {"uid": uid, "fb_url": fb_url, "fb_key": fb_key, "refcode": refcode,
+            "proxy": proxy, "at": datetime.now().strftime("%H:%M:%S")}
 
 
 async def queue_add(uid: int, fb_url: str, fb_key: str, refcode: str, proxy: str | None) -> int:
+    """Add a job. Returns queue position, or 0 when parallel mode starts it instantly."""
+    if get_queue_mode() == "parallel" and _APP is not None:
+        asyncio.create_task(_execute_job(_APP, _make_job(uid, fb_url, fb_key, refcode, proxy)))
+        return 0
     async with _QUEUE_LOCK:
-        _QUEUE.append({"uid": uid, "fb_url": fb_url, "fb_key": fb_key,
-                       "refcode": refcode, "proxy": proxy,
-                       "at": datetime.now().strftime("%H:%M:%S")})
+        _QUEUE.append(_make_job(uid, fb_url, fb_key, refcode, proxy))
         return len(_QUEUE)
 
 
@@ -1027,31 +1106,26 @@ async def queue_clear() -> int:
 
 
 async def queue_worker(app: Application):
-    global _ACTIVE_UID
-    log.info("queue worker started")
+    global _APP
+    _APP = app
+    try:
+        saved = get_setting("queue_mode", "")
+        if saved in ("serial", "parallel"):
+            global _QUEUE_MODE
+            _QUEUE_MODE = saved
+    except Exception:
+        pass
+    log.info("queue worker started (mode=%s)", get_queue_mode())
     while True:
+        if get_queue_mode() != "serial":
+            await asyncio.sleep(2)  # parallel mode: jobs start instantly, worker idles
+            continue
         async with _QUEUE_LOCK:
             job = _QUEUE.popleft() if _QUEUE else None
         if not job:
             await asyncio.sleep(2)
             continue
-        _ACTIVE_UID = job["uid"]
-        try:
-            await app.bot.send_message(job["uid"], "*Your turn started.*", parse_mode="Markdown")
-        except Exception:
-            pass
-        loop = asyncio.get_running_loop()
-        try:
-            await asyncio.to_thread(run_firebase_job, app.bot, loop, job["uid"],
-                                    job["uid"], job["fb_url"], job["fb_key"],
-                                    job["refcode"], job["proxy"])
-        except Exception as e:
-            log.error("job crash uid=%s: %s", job["uid"], e)
-            try:
-                await app.bot.send_message(job["uid"], "Job stopped due to an error. Contact admin.")
-            except Exception:
-                pass
-        _ACTIVE_UID = None
+        await _execute_job(app, job)
 
 
 # ============================ UI HELPERS ============================
@@ -1272,7 +1346,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                "Share your referral link to earn points.",
                             parse_mode="Markdown", reply_markup=main_menu_kb(is_admin(uid)))
             return
-        if await queue_position(uid) is not None or _ACTIVE_UID == uid:
+        if await queue_position(uid) is not None or uid in _ACTIVE:
             await safe_edit(q, "You already have a job in queue / running. Wait for it to finish.",
                             parse_mode="Markdown", reply_markup=main_menu_kb(is_admin(uid)))
             return
@@ -1288,16 +1362,21 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="m_back")]]))
     elif data == "m_queue":
         pos = await queue_position(uid)
-        running = (_ACTIVE_UID == uid)
+        running = (uid in _ACTIVE)
         pend = await queue_list()
+        mode = get_queue_mode()
         if running:
-            txt = "*MY QUEUE*\n------------------------\nStatus: *PROCESSING NOW* - your Firebase is running."
+            txt = "*MY STATUS*\n------------------------\nStatus: *PROCESSING NOW* - your Firebase is running."
         elif pos:
             txt = (f"*MY QUEUE*\n------------------------\nPosition: *#{pos}* in queue.\n"
                    "Only one user runs at a time. You will be notified on your turn.")
+        elif mode == "parallel":
+            txt = ("*MY STATUS*\n------------------------\n"
+                   "Parallel mode is ON: jobs start instantly, no waiting.\n"
+                   "You have no job running right now.")
         else:
             txt = "*MY QUEUE*\n------------------------\nYou have no job in queue."
-        txt += f"\n\nTotal waiting: *{len(pend)}*"
+        txt += f"\n\nWaiting: *{len(pend)}* | Running now: *{len(_ACTIVE)}*"
         kb = [[InlineKeyboardButton("🔙 Back", callback_data="m_back")]]
         if pos:
             kb = [[InlineKeyboardButton("❌ Cancel My Job", callback_data="q_cancel",
@@ -1364,6 +1443,9 @@ async def show_admin(q_or_msg, context):
         [InlineKeyboardButton("🎁 Bonus All", callback_data="a_bonusall",
                               style=STYLE_SUCCESS, icon_custom_emoji_id=ICON_GREEN),
          InlineKeyboardButton("🔙 Back", callback_data="m_back")],
+        [InlineKeyboardButton(f"⏳ Queue: {get_queue_mode().upper()} (tap to switch)",
+                              callback_data="a_qmode",
+                              style=STYLE_PRIMARY, icon_custom_emoji_id=ICON_OFFERS)],
     ])
     if hasattr(q_or_msg, "edit_message_text"):
         await safe_edit(q_or_msg, text, parse_mode="Markdown", reply_markup=kb)
@@ -1391,16 +1473,23 @@ async def on_admin_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         con.close()
         await safe_edit(q, f"*STATISTICS*\n------------------------\nUsers: *{users}*\n"
                            f"Referrals: *{refs}*\nJobs done: *{jobs}*\nSuccessful refers: *{succ}*\n"
-                           f"Points in system: *{pts}*\nQueue waiting: *{len(pend)}*"
-                           f"{' | RUNNING: ' + str(_ACTIVE_UID) if _ACTIVE_UID else ''}",
+                           f"Points in system: *{pts}*\nMode: *{get_queue_mode().upper()}*\n"
+                           f"Queue waiting: *{len(pend)}* | Running now: *{len(_ACTIVE)}*",
                         parse_mode="Markdown", reply_markup=back)
     elif data == "a_queue":
         pend = await queue_list()
         lines = [f"{i+1}. `{j['uid']}` at {j['at']}" for i, j in enumerate(pend)] or ["Queue is empty."]
-        if _ACTIVE_UID:
-            lines.insert(0, f"RUNNING: `{_ACTIVE_UID}`")
+        if _ACTIVE:
+            lines.insert(0, "RUNNING: " + ", ".join(f"`{x}`" for x in sorted(_ACTIVE)))
         await safe_edit(q, "*QUEUE*\n------------------------\n" + "\n".join(lines) +
                            "\n\n/clearqueue empties the waiting list.",
+                        parse_mode="Markdown", reply_markup=back)
+    elif data == "a_qmode":
+        mode = set_queue_mode("")
+        await safe_edit(q, f"*Queue mode changed to: {mode.upper()}*\n------------------------\n" +
+                           ("One user at a time, rest wait in queue."
+                            if mode == "serial" else
+                            "Everyone's job starts instantly, all run together."),
                         parse_mode="Markdown", reply_markup=back)
     elif data == "a_channels":
         chs = get_channels()
@@ -1651,7 +1740,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if err:
             await update.message.reply_text(err, parse_mode="Markdown")
             return
-        if await queue_position(uid) is not None or _ACTIVE_UID == uid:
+        if await queue_position(uid) is not None or uid in _ACTIVE:
             context.user_data.pop("awaiting", None)
             await update.message.reply_text("You already have a job in queue / running.",
                                             reply_markup=main_menu_kb(is_admin(uid)))
@@ -1680,9 +1769,13 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pos = await queue_add(uid, fb_url, fb_key, refcode, entry)
         context.user_data.pop("awaiting", None)
         nu = get_user(uid)
+        if pos == 0:
+            place = "Starting *now* (parallel mode - no waiting)."
+        else:
+            place = f"Queue position: *#{pos}* (one user runs at a time)."
         await wait.edit_text(
             f"*Firebase accepted.*\nHost: `{fb_host(fb_url)}`\n"
-            f"Queue position: *#{pos}* (one user runs at a time).\n"
+            f"{place}\n"
             f"-*{COST_PER_JOB}* point | Balance: *{nu['points']}*\n\n"
             "You will be notified when your turn starts.",
             parse_mode="Markdown", reply_markup=main_menu_kb(is_admin(uid)))
@@ -1727,7 +1820,7 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_queue(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_user.id
     pos = await queue_position(uid)
-    if _ACTIVE_UID == uid:
+    if uid in _ACTIVE:
         await update.message.reply_text("Status: *PROCESSING NOW*.", parse_mode="Markdown")
     elif pos:
         await update.message.reply_text(f"Queue position: *#{pos}*.", parse_mode="Markdown")
@@ -1747,6 +1840,20 @@ async def cmd_clearqueue(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     n = await queue_clear()
     await update.message.reply_text(f"Queue cleared: {n} waiting job(s) removed.")
+
+
+async def cmd_queuemode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return
+    if context.args and context.args[0].lower() in ("serial", "parallel"):
+        mode = set_queue_mode(context.args[0].lower())
+    else:
+        mode = set_queue_mode("")  # toggle
+    await update.message.reply_text(
+        f"Queue mode: *{mode.upper()}*\n" +
+        ("One user at a time, rest wait in queue."
+         if mode == "serial" else "Everyone's job starts instantly, all run together."),
+        parse_mode="Markdown")
 
 
 async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1881,6 +1988,7 @@ def main():
     app.add_handler(CommandHandler("queue", cmd_queue))
     app.add_handler(CommandHandler("cancelq", cmd_cancelq))
     app.add_handler(CommandHandler("clearqueue", cmd_clearqueue))
+    app.add_handler(CommandHandler("queuemode", cmd_queuemode))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("addchannel", cmd_addchannel))
