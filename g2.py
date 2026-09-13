@@ -13,7 +13,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 # ==========================================
 # CONFIGURATION
 # ==========================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8232062513:AAHBgxpOPBrRVO8OlhayOYsqBJAbICa0pa0")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = os.getenv("ADMIN_ID", "8139558808")
 BOT_USERNAME = "@papukhelu_bot"
 
